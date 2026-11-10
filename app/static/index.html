@@ -396,6 +396,28 @@
       { position: 'topright' }
     ).addTo(map);
 
+    function formatPositionAge(pos) {
+      if (!pos) return 'Unknown';
+      const tsStr = pos.positionReceived || pos.timestamp || pos.updateTime;
+      if (!tsStr) return pos.fetched_at ? 'Recently checked' : 'Unknown';
+      
+      const d = new Date(tsStr);
+      if (isNaN(d.getTime())) return tsStr;
+      
+      const now = new Date();
+      const diffSec = Math.floor((now - d) / 1000);
+      
+      const dateStr = d.toLocaleDateString('en-US', { day: '2-digit', month: 'short', year: 'numeric' });
+      const timeStr = d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+      
+      if (diffSec < 60) return 'Just now';
+      if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m ago`;
+      if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}h ago`;
+      const days = Math.floor(diffSec / 86400);
+      if (days === 1) return `Yesterday, ${timeStr}`;
+      return `${dateStr}, ${timeStr} (${days}d ago)`;
+    }
+
     function createShipIcon(heading, color) {
       const angle = (heading !== undefined && heading !== null && !isNaN(heading)) ? heading : 0;
       const svg = `
@@ -701,7 +723,7 @@
               </div>` : ''}
 
               <div class="text-[10px] text-slate-400 flex items-center justify-between pt-1 border-t border-slate-800">
-                <span>Updated: ${pos.positionReceived || pos.fetched_at || 'Just now'}</span>
+                <span>Updated: ${formatPositionAge(pos)}</span>
               </div>
 
               <button onclick="openTrackPanel('${v.mmsi}', '${color}')" class="w-full mt-2 py-1.5 px-2 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white rounded text-[11px] font-semibold transition flex items-center justify-center space-x-1.5 shadow-sm">
