@@ -120,6 +120,25 @@
         </label>
         <span id="active-counter-badge" class="text-[10px] mono text-emerald-400 font-semibold bg-emerald-500/10 px-1.5 py-0.5 rounded border border-emerald-500/20">0 active</span>
       </div>
+
+      <!-- Max Position Age Slider for Live Map -->
+      <div class="p-2 bg-slate-950/40 rounded-lg border border-slate-800/80 space-y-1.5">
+        <div class="flex items-center justify-between text-xs">
+          <span class="text-[11px] text-slate-400 flex items-center gap-1.5 font-medium">
+            <span>⏱️ Live Map Max Age:</span>
+          </span>
+          <span id="sidebar-max-age-label" class="px-2 py-0.5 rounded bg-blue-600/20 text-blue-400 font-semibold mono text-[10px] border border-blue-500/30">max. 30 days</span>
+        </div>
+        <input id="sidebar-max-age-slider" type="range" min="1" max="91" step="1" value="30" 
+               oninput="onMaxAgeSliderChange(this.value)" class="w-full h-1 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-blue-500" />
+        <div class="flex justify-between text-[9px] text-slate-500 font-mono">
+          <span>24h</span>
+          <span>7d</span>
+          <span>30d</span>
+          <span>60d</span>
+          <span>All</span>
+        </div>
+      </div>
     </div>
 
     <!-- Vessel List -->
@@ -280,7 +299,7 @@
         <button onclick="closeSettingsModal()" class="text-slate-400 hover:text-slate-200">✕</button>
       </div>
       <form onsubmit="submitSettings(event)" class="space-y-4 text-xs">
-        <!-- Interval Slider -->
+        <!-- Map Refresh Interval -->
         <div class="p-3 bg-slate-950/60 rounded-xl border border-slate-800 space-y-2">
           <div class="flex items-center justify-between">
             <div>
@@ -297,6 +316,26 @@
             <span>60m</span>
             <span>90m</span>
             <span>120m</span>
+          </div>
+        </div>
+
+        <!-- Max Position Age on Live Map Slider -->
+        <div class="p-3 bg-slate-950/60 rounded-xl border border-slate-800 space-y-2">
+          <div class="flex items-center justify-between">
+            <div>
+              <div class="font-medium text-slate-200">Max. Live Map Position Age</div>
+              <div class="text-[11px] text-slate-500">Hide older historical positions from the live map view</div>
+            </div>
+            <span id="max-age-slider-label" class="px-2 py-0.5 rounded bg-blue-600/20 text-blue-400 font-semibold mono text-xs border border-blue-500/30">max. 30 days</span>
+          </div>
+          <input id="settings-max-age" type="range" min="1" max="91" step="1" value="30" 
+                 oninput="onMaxAgeSliderChange(this.value)" class="w-full h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-blue-500" />
+          <div class="flex justify-between text-[10px] text-slate-500">
+            <span>24h</span>
+            <span>7 Days</span>
+            <span>30 Days</span>
+            <span>60 Days</span>
+            <span>All</span>
           </div>
         </div>
 
@@ -434,14 +473,57 @@
       });
     }
 
+    let maxPositionAgeDays = parseInt(localStorage.getItem('max_position_age_days') || '30');
+
+    function getPositionAgeDays(pos) {
+      if (!pos || !pos.latitude || !pos.longitude) return Infinity;
+      const tsStr = pos.positionReceived || pos.timestamp || pos.updateTime;
+      if (!tsStr) return pos.fetched_at ? 0 : Infinity;
+      const d = new Date(tsStr);
+      if (isNaN(d.getTime())) return Infinity;
+      const now = new Date();
+      return (now - d) / (1000 * 86400);
+    }
+
+    function isPositionFresh(pos) {
+      if (!pos || !pos.latitude || !pos.longitude) return false;
+      if (maxPositionAgeDays > 90) return true;
+      return getPositionAgeDays(pos) <= maxPositionAgeDays;
+    }
+
+    function onMaxAgeSliderChange(val) {
+      maxPositionAgeDays = parseInt(val) || 30;
+      localStorage.setItem('max_position_age_days', maxPositionAgeDays.toString());
+      
+      const labelText = maxPositionAgeDays > 90 
+        ? 'All (Unlimited)' 
+        : (maxPositionAgeDays === 1 ? 'max. 24h' : `max. ${maxPositionAgeDays} days`);
+      
+      const sidebarLabel = document.getElementById('sidebar-max-age-label');
+      if (sidebarLabel) sidebarLabel.textContent = labelText;
+      
+      const settingsLabel = document.getElementById('max-age-slider-label');
+      if (settingsLabel) settingsLabel.textContent = labelText;
+      
+      const sidebarSlider = document.getElementById('sidebar-max-age-slider');
+      if (sidebarSlider && sidebarSlider.value != maxPositionAgeDays) sidebarSlider.value = maxPositionAgeDays;
+      
+      const settingsSlider = document.getElementById('settings-max-age');
+      if (settingsSlider && settingsSlider.value != maxPositionAgeDays) settingsSlider.value = maxPositionAgeDays;
+      
+      updateCountsBadge();
+      updateMapMarkers();
+      renderVesselList();
+    }
+
     function updateCountsBadge() {
-      const withPos = allVessels.filter(v => v.last_position && v.last_position.latitude && v.last_position.longitude).length;
+      const withPos = allVessels.filter(v => isPositionFresh(v.last_position)).length;
       const elTotal = document.getElementById('stat-total');
       const elWithPos = document.getElementById('stat-with-pos');
       const badge = document.getElementById('active-counter-badge');
       if (elTotal) elTotal.textContent = `${allVessels.length} Vessels`;
-      if (elWithPos) elWithPos.textContent = `${withPos} with Position`;
-      if (badge) badge.textContent = `${withPos} active`;
+      if (elWithPos) elWithPos.textContent = `${withPos} on Live Map`;
+      if (badge) badge.textContent = `${withPos} active (≤${maxPositionAgeDays > 90 ? '∞' : maxPositionAgeDays + 'd'})`;
     }
 
     async function loadVessels() {
@@ -682,7 +764,7 @@
 
       allVessels.forEach(v => {
         const pos = v.last_position;
-        if (pos && pos.latitude && pos.longitude) {
+        if (isPositionFresh(pos)) {
           const lat = parseFloat(pos.latitude);
           const lon = parseFloat(pos.longitude);
           if (isNaN(lat) || isNaN(lon)) return;
@@ -757,8 +839,8 @@
 
       const filtered = allVessels.filter(v => {
         const pos = v.last_position;
-        const hasPos = pos && pos.latitude && pos.longitude;
-        if (onlyActivePositions && !hasPos) return false;
+        const isFresh = isPositionFresh(pos);
+        if (onlyActivePositions && !isFresh) return false;
 
         const matchesCategory = (selectedCategory === 'ALL' || v.category === selectedCategory);
         const text = `${v.name} ${v.callsign || ''} ${v.mmsi} ${v.class_name || ''} ${v.homeport || ''}`.toLowerCase();
@@ -774,15 +856,22 @@
       container.innerHTML = filtered.map(v => {
         const color = categoryColors[v.category] || '#38bdf8';
         const pos = v.last_position;
+        const isFresh = isPositionFresh(pos);
         const hasPos = pos && pos.latitude && pos.longitude;
-        const speed = hasPos ? (parseFloat(pos.speed) || 0).toFixed(1) : null;
-        const status = hasPos ? (pos.navigationalStatus || 'Active') : 'No Position';
+        const speed = isFresh ? (parseFloat(pos.speed) || 0).toFixed(1) : null;
+        let status = 'No Position';
+        if (isFresh) {
+          status = pos.navigationalStatus || 'Active';
+        } else if (hasPos) {
+          const daysAgo = Math.floor(getPositionAgeDays(pos));
+          status = `Archive (${daysAgo}d ago)`;
+        }
 
         return `
           <div onclick="focusVessel('${v.mmsi}')" class="group p-2.5 rounded-xl hover:bg-slate-800/80 cursor-pointer transition border border-transparent hover:border-slate-700/60 flex flex-col space-y-1.5">
             <div class="flex items-center justify-between">
               <div class="flex items-center space-x-2">
-                <span class="w-2.5 h-2.5 rounded-full shrink-0" style="background: ${hasPos ? color : '#475569'}"></span>
+                <span class="w-2.5 h-2.5 rounded-full shrink-0" style="background: ${isFresh ? color : (hasPos ? '#f59e0b' : '#475569')}" title="${isFresh ? 'Live Position Active' : (hasPos ? 'Historical (> ' + maxPositionAgeDays + 'd)' : 'No Position')}"></span>
                 <span class="font-semibold text-xs text-slate-100 group-hover:text-blue-400 transition">${v.name}</span>
                 ${v.callsign ? `<span class="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 mono">${v.callsign}</span>` : ''}
               </div>
@@ -792,7 +881,7 @@
             </div>
 
             <div class="flex items-center justify-between text-[11px] text-slate-400 pl-4.5">
-              <span class="${hasPos ? 'text-slate-300' : 'text-slate-600'}">${status} ${speed !== null ? '• ' + speed + ' kn' : ''}</span>
+              <span class="${isFresh ? 'text-slate-300' : (hasPos ? 'text-amber-400/90' : 'text-slate-600')}">${status} ${speed !== null ? '• ' + speed + ' kn' : ''}</span>
               <div class="flex items-center space-x-1.5 opacity-0 group-hover:opacity-100 transition" onclick="event.stopPropagation()">
                 <button onclick="refreshSingle('${v.mmsi}')" title="Refresh" class="p-1 hover:text-blue-400 text-slate-400">
                   <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
@@ -1015,6 +1104,10 @@
       onSliderChange(interval);
       document.getElementById('settings-daily').checked = !!cfg.auto_refresh_daily;
 
+      const maxAgeEl = document.getElementById('settings-max-age');
+      if (maxAgeEl) maxAgeEl.value = maxPositionAgeDays;
+      onMaxAgeSliderChange(maxPositionAgeDays);
+
       document.getElementById('modal-settings').classList.remove('hidden');
     }
 
@@ -1044,6 +1137,7 @@
     }
 
     // Initial load
+    onMaxAgeSliderChange(maxPositionAgeDays);
     loadVessels().then(async () => {
       try {
         const res = await fetch('/api/status');

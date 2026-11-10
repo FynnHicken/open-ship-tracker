@@ -7,6 +7,7 @@
 ## Highlights
 
 - **Real-Time AIS Stream**: Ingest live vessel positions directly from [AISStream.io](https://aisstream.io) via WebSocket.
+- **Native iOS App**: Full-featured SwiftUI & MapKit app with Onboarding Setup-Wizard, standalone live WebSocket client, voyage tracking, and server sync.
 - **Interactive Dark Map**: Leaflet-based map with Dark Matter tiles, OpenSeaMap nautical marks, heading vectors, and live position markers.
 - **Voyage & Track Filtering**: Inspect historical voyages with flexible time range presets (24h, 7d, 30d, all, custom date/time) and automatic nautical mile and speed calculations.
 - **Custom Fleet Management**: Add, categorize, and track custom ships by MMSI.
@@ -56,6 +57,18 @@ pip install -r requirements.txt
 export DATA_DIR="./data"
 uvicorn app.main:app --host 0.0.0.0 --port 8050
 ```
+
+---
+
+## iOS App (Xcode)
+
+A fully native iOS application (SwiftUI / MapKit) is located inside `ios/`:
+
+```bash
+open ios/OpenShipTracker.xcodeproj
+```
+
+Features an interactive **Setup Wizard** upon first launch to configure your AISStream API key, choose between direct standalone tracking or connecting to your self-hosted server, and select your starter fleet.
 
 ---
 

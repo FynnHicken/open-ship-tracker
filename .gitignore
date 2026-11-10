@@ -24,3 +24,11 @@ env/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Xcode & Apple build artifacts
+*.xcuserstate
+*.xcuserdatad
+xcuserdata/
+DerivedData/
+.build/
+
