@@ -1,0 +1,1037 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OpenShipTracker – Open Source AIS Vessel Tracker</title>
+  <!-- Tailwind CSS & Lucide Icons -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Leaflet CSS & JS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <!-- Google Fonts: Inter -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    body { font-family: "Inter", sans-serif; }
+    .mono { font-family: "JetBrains Mono", monospace; }
+    .leaflet-popup-content-wrapper {
+      background: #0f172a !important;
+      color: #f1f5f9 !important;
+      border-radius: 12px !important;
+      border: 1px solid #334155 !important;
+      box-shadow: 0 20px 25px -5px rgba(0,0,0,0.5), 0 8px 10px -6px rgba(0,0,0,0.5) !important;
+    }
+    .leaflet-popup-tip {
+      background: #0f172a !important;
+      border: 1px solid #334155 !important;
+    }
+    .custom-scrollbar::-webkit-scrollbar { width: 6px; }
+    .custom-scrollbar::-webkit-scrollbar-track { background: #0f172a; }
+    .custom-scrollbar::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+    .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #475569; }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-100 flex flex-col md:flex-row h-screen overflow-hidden">
+
+  <!-- SIDEBAR -->
+  <aside class="w-full md:w-96 bg-slate-900 border-r border-slate-800 flex flex-col z-20 shadow-2xl shrink-0 h-1/2 md:h-full">
+    <!-- Header -->
+    <div class="p-4 border-b border-slate-800 flex items-center justify-between bg-slate-900/90 backdrop-blur">
+      <div class="flex items-center space-x-3">
+        <div class="w-10 h-10 rounded-xl bg-blue-600/20 border border-blue-500/30 flex items-center justify-center text-blue-400 font-bold text-lg">
+          🚢
+        </div>
+        <div>
+          <div class="flex items-center space-x-2">
+            <h1 class="font-bold text-slate-100 text-sm tracking-wide">OpenShipTracker</h1>
+            <span id="badge-stream" class="flex items-center space-x-1 px-1.5 py-0.5 rounded text-[10px] bg-slate-800 text-slate-500 border border-slate-700 font-medium">
+              <span class="w-1.5 h-1.5 rounded-full bg-slate-500"></span>
+              <span>AISStream</span>
+            </span>
+            <span id="badge-timer" class="hidden sm:inline-flex items-center px-1.5 py-0.5 rounded text-[10px] bg-slate-800 text-slate-400 mono">
+              ⏱️ <span id="timer-countdown">10:00</span>
+            </span>
+          </div>
+          <p class="text-xs text-slate-400">Live AIS Fleet Monitor</p>
+        </div>
+      </div>
+      <button onclick="openSettingsModal()" class="p-2 text-slate-400 hover:text-slate-200 hover:bg-slate-800 rounded-lg transition" title="Settings">
+        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
+      </button>
+    </div>
+
+    <!-- Quick Stats & Actions -->
+    <div class="p-3 bg-slate-900/50 border-b border-slate-800 space-y-2">
+      <div class="flex items-center justify-between text-xs text-slate-400 px-1">
+        <span id="stat-total">0 Vessels</span>
+        <span id="stat-with-pos" class="text-emerald-400 font-medium">0 with Position</span>
+      </div>
+
+      <!-- Action Buttons -->
+      <div class="grid grid-cols-2 gap-2">
+        <button id="btn-refresh-all" onclick="refreshAll()" class="w-full flex items-center justify-center space-x-1.5 px-3 py-2 bg-blue-600 hover:bg-blue-500 active:bg-blue-700 text-white text-xs font-semibold rounded-lg shadow-sm transition">
+          <svg id="icon-refresh" class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+          <span id="label-refresh">Refresh All</span>
+        </button>
+        <button onclick="openAddModal()" class="w-full flex items-center justify-center space-x-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold rounded-lg border border-slate-700 transition">
+          <svg class="w-4 h-4 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>
+          <span>Add Vessel</span>
+        </button>
+      </div>
+
+      <!-- Refresh progress bar -->
+      <div id="refresh-progress-container" class="hidden pt-1">
+        <div class="flex justify-between text-[11px] text-slate-400 mb-1">
+          <span id="progress-text">Updating 0 / 0...</span>
+          <span id="progress-pct">0%</span>
+        </div>
+        <div class="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
+          <div id="progress-bar" class="bg-blue-500 h-1.5 rounded-full transition-all duration-300" style="width: 0%"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Filter Pills & Search -->
+    <div class="p-3 border-b border-slate-800 space-y-2">
+      <div class="relative">
+        <input id="search-input" oninput="filterVessels()" type="text" placeholder="Search name, callsign or MMSI..." 
+               class="w-full pl-9 pr-3 py-1.5 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500" />
+        <svg class="w-4 h-4 text-slate-500 absolute left-2.5 top-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
+      </div>
+
+      <!-- Categories Pills -->
+      <div class="flex flex-wrap gap-1 text-[11px]">
+        <button onclick="setCategory('ALL')" class="cat-pill px-2 py-0.5 rounded-md font-medium transition bg-blue-600 text-white" data-cat="ALL">All</button>
+        <button onclick="setCategory('Forschung')" class="cat-pill px-2 py-0.5 rounded-md font-medium transition bg-slate-800 text-slate-400 hover:text-slate-200" data-cat="Forschung">Research</button>
+        <button onclick="setCategory('Segler')" class="cat-pill px-2 py-0.5 rounded-md font-medium transition bg-slate-800 text-slate-400 hover:text-slate-200" data-cat="Segler">Sail</button>
+        <button onclick="setCategory('Rettung')" class="cat-pill px-2 py-0.5 rounded-md font-medium transition bg-slate-800 text-slate-400 hover:text-slate-200" data-cat="Rettung">Rescue</button>
+        <button onclick="setCategory('Frachter')" class="cat-pill px-2 py-0.5 rounded-md font-medium transition bg-slate-800 text-slate-400 hover:text-slate-200" data-cat="Frachter">Cargo</button>
+        <button onclick="setCategory('Passagier')" class="cat-pill px-2 py-0.5 rounded-md font-medium transition bg-slate-800 text-slate-400 hover:text-slate-200" data-cat="Passagier">Passenger</button>
+        <button onclick="setCategory('Behörde')" class="cat-pill px-2 py-0.5 rounded-md font-medium transition bg-slate-800 text-slate-400 hover:text-slate-200" data-cat="Behörde">Government</button>
+      </div>
+
+      <!-- Toggle: Only vessels with position -->
+      <div class="pt-1 flex items-center justify-between text-xs text-slate-300 bg-slate-950/40 p-2 rounded-lg border border-slate-800/80">
+        <label for="filter-only-active" class="flex items-center space-x-2 cursor-pointer select-none">
+          <input id="filter-only-active" onchange="toggleOnlyActive(this.checked)" type="checkbox" class="w-4 h-4 rounded text-blue-600 bg-slate-900 border-slate-700 cursor-pointer" />
+          <span class="text-[11px] font-medium text-slate-300">Only with known position</span>
+        </label>
+        <span id="active-counter-badge" class="text-[10px] mono text-emerald-400 font-semibold bg-emerald-500/10 px-1.5 py-0.5 rounded border border-emerald-500/20">0 active</span>
+      </div>
+    </div>
+
+    <!-- Vessel List -->
+    <div id="vessel-list" class="flex-1 overflow-y-auto custom-scrollbar divide-y divide-slate-800/60 p-2 space-y-1">
+      <div class="p-4 text-center text-xs text-slate-500">Loading vessels...</div>
+    </div>
+  </aside>
+
+  <!-- MAP CONTAINER -->
+  <main class="flex-1 h-1/2 md:h-full relative">
+    <div id="map" class="w-full h-full bg-slate-950"></div>
+
+    <!-- Floating MarineTraffic-Style Track Control Panel -->
+    <div id="track-control-panel" class="absolute bottom-6 left-1/2 -translate-x-1/2 z-[1001] w-[95%] max-w-2xl bg-slate-900/95 border border-slate-700/80 rounded-2xl p-4 shadow-2xl backdrop-blur hidden transition-all duration-300">
+      
+      <!-- Panel Header -->
+      <div class="flex items-center justify-between pb-3 border-b border-slate-800">
+        <div class="flex items-center space-x-2.5">
+          <div class="w-8 h-8 rounded-lg bg-blue-600/20 border border-blue-500/30 text-blue-400 flex items-center justify-center font-bold text-sm">
+            🧭
+          </div>
+          <div>
+            <div class="flex items-center space-x-2">
+              <span id="track-ship-name" class="font-bold text-sm text-white">Vessel</span>
+              <span id="track-ship-category" class="px-1.5 py-0.5 rounded text-[10px] font-mono font-semibold bg-slate-800 text-slate-300 border border-slate-700">-</span>
+            </div>
+            <div class="text-[10px] text-slate-400 font-mono">MMSI: <span id="track-ship-mmsi">-</span></div>
+          </div>
+        </div>
+
+        <div class="flex items-center space-x-2">
+          <span id="track-points-badge" class="px-2.5 py-1 rounded-full text-xs font-mono font-bold bg-slate-800 text-slate-400 border border-slate-700">
+            0 Waypoints
+          </span>
+          <button onclick="closeTrackPanel()" class="w-7 h-7 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white flex items-center justify-center text-sm transition" title="Close Track">
+            ✕
+          </button>
+        </div>
+      </div>
+
+      <!-- Presets & Date Inputs -->
+      <div class="py-3 space-y-2.5">
+        <!-- Quick Presets -->
+        <div class="flex items-center space-x-1.5 overflow-x-auto text-xs pb-1 custom-scrollbar">
+          <span class="text-[11px] text-slate-500 font-medium mr-1 shrink-0">Timeframe:</span>
+          <button type="button" onclick="setTrackPreset('24h')" class="track-preset-btn px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] font-medium transition shrink-0" data-preset="24h">Last 24h</button>
+          <button type="button" onclick="setTrackPreset('7d')" class="track-preset-btn px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] font-medium transition shrink-0" data-preset="7d">7 Days</button>
+          <button type="button" onclick="setTrackPreset('30d')" class="track-preset-btn px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] font-medium transition shrink-0" data-preset="30d">30 Days</button>
+          <button type="button" onclick="setTrackPreset('all')" class="track-preset-btn px-2.5 py-1 rounded-lg bg-blue-600 text-white text-[11px] font-semibold transition shrink-0" data-preset="all">Full History</button>
+          <button type="button" onclick="setTrackPreset('custom')" class="track-preset-btn px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] font-medium transition shrink-0" data-preset="custom">Custom</button>
+        </div>
+
+        <!-- Custom Date/Time Inputs (From - To) -->
+        <div id="track-custom-dates" class="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs pt-1 border-t border-slate-800/60">
+          <div class="flex items-center space-x-2">
+            <label class="text-[11px] font-semibold text-slate-400 w-10 shrink-0">From:</label>
+            <input type="datetime-local" id="track-input-start" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1 text-slate-200 text-xs focus:outline-none focus:border-blue-500">
+          </div>
+          <div class="flex items-center space-x-2">
+            <label class="text-[11px] font-semibold text-slate-400 w-10 shrink-0">To:</label>
+            <input type="datetime-local" id="track-input-end" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1 text-slate-200 text-xs focus:outline-none focus:border-blue-500">
+            <button onclick="applyCustomTrackFilter()" class="px-3 py-1 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-xs font-semibold shadow transition shrink-0">
+              Apply
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Stats Bar (Speed, Distance, Waypoints) -->
+      <div id="track-stats-bar" class="grid grid-cols-3 gap-2 pt-2.5 border-t border-slate-800 text-center text-xs">
+        <div class="bg-slate-950/60 p-1.5 rounded-lg border border-slate-800">
+          <div class="text-[10px] text-slate-500">Distance</div>
+          <div id="stat-track-dist" class="font-mono font-bold text-slate-200">0 nm</div>
+        </div>
+        <div class="bg-slate-950/60 p-1.5 rounded-lg border border-slate-800">
+          <div class="text-[10px] text-slate-500">Max Speed</div>
+          <div id="stat-track-max-spd" class="font-mono font-bold text-cyan-400">0.0 kn</div>
+        </div>
+        <div class="bg-slate-950/60 p-1.5 rounded-lg border border-slate-800">
+          <div class="text-[10px] text-slate-500">Avg Speed</div>
+          <div id="stat-track-avg-spd" class="font-mono font-bold text-emerald-400">0.0 kn</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Map Floating Overlay Legend -->
+    <div class="absolute bottom-6 right-6 z-[1000] bg-slate-900/90 border border-slate-800 rounded-xl p-3 shadow-2xl backdrop-blur hidden sm:block text-xs space-y-1.5">
+      <div class="font-semibold text-slate-300 pb-1 border-b border-slate-800 flex items-center justify-between gap-4">
+        <span>Legend</span>
+        <span class="text-[10px] text-slate-500">Click to center</span>
+      </div>
+      <div class="flex items-center space-x-2"><span class="w-3 h-3 rounded-full bg-sky-400"></span><span class="text-slate-300">Research</span></div>
+      <div class="flex items-center space-x-2"><span class="w-3 h-3 rounded-full bg-emerald-400"></span><span class="text-slate-300">Sail</span></div>
+      <div class="flex items-center space-x-2"><span class="w-3 h-3 rounded-full bg-rose-400"></span><span class="text-slate-300">Rescue</span></div>
+      <div class="flex items-center space-x-2"><span class="w-3 h-3 rounded-full bg-amber-500"></span><span class="text-slate-300">Cargo</span></div>
+      <div class="flex items-center space-x-2"><span class="w-3 h-3 rounded-full bg-purple-400"></span><span class="text-slate-300">Passenger</span></div>
+      <div class="flex items-center space-x-2"><span class="w-3 h-3 rounded-full bg-blue-400"></span><span class="text-slate-300">Government</span></div>
+    </div>
+  </main>
+
+  <!-- MODAL: ADD VESSEL -->
+  <div id="modal-add" onclick="if (event.target === this) closeAddModal()" class="hidden fixed inset-0 z-[10000] bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-md p-6 shadow-2xl space-y-4">
+      <div class="flex items-center justify-between border-b border-slate-800 pb-3">
+        <h3 class="font-bold text-slate-100 text-sm">Add New Vessel</h3>
+        <button onclick="closeAddModal()" class="text-slate-400 hover:text-slate-200">✕</button>
+      </div>
+      <form onsubmit="submitAddVessel(event)" class="space-y-3 text-xs">
+        <div>
+          <label class="block text-slate-400 mb-1">MMSI (9 digits) *</label>
+          <input id="add-mmsi" type="text" required placeholder="e.g. 211202710" class="w-full p-2 bg-slate-950 border border-slate-800 rounded-lg text-slate-200 focus:outline-none focus:border-blue-500 font-mono" />
+        </div>
+        <div>
+          <label class="block text-slate-400 mb-1">Vessel Name *</label>
+          <input id="add-name" type="text" required placeholder="e.g. Polarstern" class="w-full p-2 bg-slate-950 border border-slate-800 rounded-lg text-slate-200 focus:outline-none focus:border-blue-500" />
+        </div>
+        <div class="grid grid-cols-2 gap-2">
+          <div>
+            <label class="block text-slate-400 mb-1">Callsign</label>
+            <input id="add-callsign" type="text" placeholder="e.g. DBLK" class="w-full p-2 bg-slate-950 border border-slate-800 rounded-lg text-slate-200 focus:outline-none focus:border-blue-500 font-mono" />
+          </div>
+          <div>
+            <label class="block text-slate-400 mb-1">Category</label>
+            <select id="add-category" class="w-full p-2 bg-slate-950 border border-slate-800 rounded-lg text-slate-200 focus:outline-none focus:border-blue-500">
+              <option value="Forschung">Research</option>
+              <option value="Segler">Sail</option>
+              <option value="Rettung">Rescue</option>
+              <option value="Frachter">Cargo</option>
+              <option value="Passagier">Passenger</option>
+              <option value="Behörde">Government</option>
+              <option value="Sonstige">Other</option>
+            </select>
+          </div>
+        </div>
+        <div>
+          <label class="block text-slate-400 mb-1">Type / Class</label>
+          <input id="add-class" type="text" placeholder="e.g. Research Icebreaker" class="w-full p-2 bg-slate-950 border border-slate-800 rounded-lg text-slate-200 focus:outline-none focus:border-blue-500" />
+        </div>
+        <div>
+          <label class="block text-slate-400 mb-1">Home Port</label>
+          <input id="add-homeport" type="text" placeholder="e.g. Bremerhaven" class="w-full p-2 bg-slate-950 border border-slate-800 rounded-lg text-slate-200 focus:outline-none focus:border-blue-500" />
+        </div>
+        <div class="pt-3 flex justify-end space-x-2">
+          <button type="button" onclick="closeAddModal()" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 rounded-lg text-slate-300">Cancel</button>
+          <button type="submit" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-lg text-white font-semibold">Save</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- MODAL: SETTINGS -->
+  <div id="modal-settings" onclick="if (event.target === this) closeSettingsModal()" class="hidden fixed inset-0 z-[10000] bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-md p-6 shadow-2xl space-y-4">
+      <div class="flex items-center justify-between border-b border-slate-800 pb-3">
+        <h3 class="font-bold text-slate-100 text-sm flex items-center gap-2">
+          <span>⚙️ Settings</span>
+        </h3>
+        <button onclick="closeSettingsModal()" class="text-slate-400 hover:text-slate-200">✕</button>
+      </div>
+      <form onsubmit="submitSettings(event)" class="space-y-4 text-xs">
+        <!-- Interval Slider -->
+        <div class="p-3 bg-slate-950/60 rounded-xl border border-slate-800 space-y-2">
+          <div class="flex items-center justify-between">
+            <div>
+              <div class="font-medium text-slate-200">Map Refresh Interval</div>
+              <div class="text-[11px] text-slate-500">Pulls latest positions from server</div>
+            </div>
+            <span id="slider-label" class="px-2 py-0.5 rounded bg-blue-600/20 text-blue-400 font-semibold mono text-xs border border-blue-500/30">10 Min</span>
+          </div>
+          <input id="settings-interval" type="range" min="1" max="120" step="1" value="10" 
+                 oninput="onSliderChange(this.value)" class="w-full h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-blue-500" />
+          <div class="flex justify-between text-[10px] text-slate-500">
+            <span>1m</span>
+            <span>30m</span>
+            <span>60m</span>
+            <span>90m</span>
+            <span>120m</span>
+          </div>
+        </div>
+
+        <!-- Daily Auto-Update -->
+        <div class="flex items-center justify-between p-3 bg-slate-950/60 rounded-xl border border-slate-800">
+          <div>
+            <div class="font-medium text-slate-200">Daily Fleet Refresh (06:00 UTC)</div>
+            <div class="text-[11px] text-slate-500">Periodic batch query for all ships</div>
+          </div>
+          <input id="settings-daily" type="checkbox" class="w-4 h-4 text-blue-600 rounded bg-slate-900 border-slate-700 cursor-pointer" />
+        </div>
+
+        <!-- API Keys Section -->
+        <div class="border-t border-slate-800 pt-3 space-y-3">
+          <div class="font-medium text-slate-200 flex items-center gap-2">
+            <span>🔑 AIS Data Providers</span>
+          </div>
+
+          <div>
+            <label class="block text-slate-400 mb-1 font-medium">AISStream.io API Key (Free Real-time WebSocket)</label>
+            <input id="settings-aisstream" type="password" placeholder="Get free key at aisstream.io" class="w-full p-2 bg-slate-950 border border-slate-800 rounded-lg text-slate-200 focus:outline-none focus:border-blue-500 font-mono text-xs" />
+            <p class="text-[10px] text-slate-500 mt-1">Free real-time worldwide AIS via WebSocket</p>
+          </div>
+
+          <div>
+            <label class="block text-slate-400 mb-1 font-medium">DataDocked / VesselFinder REST Key (Optional)</label>
+            <input id="settings-key" type="password" placeholder="Optional fallback API key" class="w-full p-2 bg-slate-950 border border-slate-800 rounded-lg text-slate-200 focus:outline-none focus:border-blue-500 font-mono text-xs" />
+            <p class="text-[10px] text-slate-500 mt-1">Used for manual on-demand vessel lookups</p>
+          </div>
+        </div>
+
+        <div class="pt-3 flex justify-end space-x-2 border-t border-slate-800">
+          <button type="button" onclick="closeSettingsModal()" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 rounded-lg text-slate-300">Close</button>
+          <button type="submit" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-lg text-white font-semibold">Save</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Toast Notification -->
+  <div id="toast" class="fixed bottom-6 left-1/2 -translate-x-1/2 z-[10001] px-4 py-2.5 rounded-xl bg-slate-900/95 border border-slate-700/80 text-xs text-slate-200 shadow-2xl backdrop-blur transition-all duration-300 opacity-0 pointer-events-none translate-y-2"></div>
+
+  <script>
+    function showToast(msg, isError = false) {
+      const t = document.getElementById('toast');
+      if (!t) return;
+      t.innerHTML = msg;
+      t.className = `fixed bottom-6 left-1/2 -translate-x-1/2 z-[10001] px-4 py-2.5 rounded-xl bg-slate-900/95 border ${isError ? 'border-rose-500/50 text-rose-300' : 'border-slate-700/80 text-slate-200'} shadow-2xl backdrop-blur transition-all duration-300 opacity-100 translate-y-0`;
+      clearTimeout(window.toastTimeout);
+      window.toastTimeout = setTimeout(() => {
+        t.className = 'fixed bottom-6 left-1/2 -translate-x-1/2 z-[10001] px-4 py-2.5 rounded-xl bg-slate-900/95 border border-slate-700/80 text-xs text-slate-200 shadow-2xl backdrop-blur transition-all duration-300 opacity-0 pointer-events-none translate-y-2';
+      }, 2800);
+    }
+
+    let allVessels = [];
+    let selectedCategory = 'ALL';
+    let onlyActivePositions = false;
+    let markersMap = {};
+    let activeTrackLayer = null;
+
+    const categoryColors = {
+      'Forschung': '#38bdf8', // sky-400
+      'Segler': '#34d399',    // emerald-400
+      'Rettung': '#fb7185',   // rose-400
+      'Frachter': '#f59e0b',  // amber-500
+      'Passagier': '#c084fc', // purple-400
+      'Behörde': '#60a5fa',   // blue-400
+      'Sonstige': '#94a3b8'  // slate-400
+    };
+
+    // Initialize Map
+    const map = L.map('map', {
+      zoomControl: false
+    }).setView([54.3, 10.5], 5);
+
+    L.control.zoom({ position: 'topright' }).addTo(map);
+
+    // OpenStreetMap & Nautical layers
+    const osmLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; OpenStreetMap contributors',
+      maxZoom: 19
+    });
+
+    const darkLayer = L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/dark_all/{z}/{x}/{y}{r}.png', {
+      attribution: '&copy; OpenStreetMap contributors &copy; CARTO',
+      maxZoom: 19
+    }).addTo(map);
+
+    const seamarks = L.tileLayer('https://tiles.openseamap.org/seamark/{z}/{x}/{y}.png', {
+      attribution: '&copy; OpenSeaMap',
+      maxZoom: 18
+    });
+
+    L.control.layers(
+      { 'Dark Theme': darkLayer, 'OpenStreetMap': osmLayer },
+      { 'Nautical Seamarks (OpenSeaMap)': seamarks },
+      { position: 'topright' }
+    ).addTo(map);
+
+    function createShipIcon(heading, color) {
+      const angle = (heading !== undefined && heading !== null && !isNaN(heading)) ? heading : 0;
+      const svg = `
+        <svg width="28" height="28" viewBox="0 0 32 32" style="transform: rotate(${angle}deg); transform-origin: center; filter: drop-shadow(0 2px 4px rgba(0,0,0,0.8));">
+          <path d="M16 2 L25 24 L16 20 L7 24 Z" fill="${color}" stroke="#0f172a" stroke-width="2" stroke-linejoin="round" />
+        </svg>
+      `;
+      return L.divIcon({
+        className: 'custom-ship-marker',
+        html: svg,
+        iconSize: [28, 28],
+        iconAnchor: [14, 14],
+        popupAnchor: [0, -14]
+      });
+    }
+
+    function updateCountsBadge() {
+      const withPos = allVessels.filter(v => v.last_position && v.last_position.latitude && v.last_position.longitude).length;
+      const elTotal = document.getElementById('stat-total');
+      const elWithPos = document.getElementById('stat-with-pos');
+      const badge = document.getElementById('active-counter-badge');
+      if (elTotal) elTotal.textContent = `${allVessels.length} Vessels`;
+      if (elWithPos) elWithPos.textContent = `${withPos} with Position`;
+      if (badge) badge.textContent = `${withPos} active`;
+    }
+
+    async function loadVessels() {
+      try {
+        const res = await fetch('/api/vessels');
+        const data = await res.json();
+        allVessels = data.vessels || [];
+        updateCountsBadge();
+        updateMapMarkers();
+        renderVesselList();
+        checkProgress(data.refresh_state);
+      } catch (e) {
+        console.error('Error loading vessels:', e);
+      }
+    }
+
+    function toggleOnlyActive(checked) {
+      onlyActivePositions = checked;
+      renderVesselList();
+    }
+
+    // --- TRACK SYSTEM & ROUTE FILTERING ---
+    let currentTrackMmsi = null;
+    let currentTrackColor = '#38bdf8';
+    let currentTrackPreset = 'all';
+
+    function haversineKm(lat1, lon1, lat2, lon2) {
+      const R = 6371;
+      const dLat = (lat2 - lat1) * Math.PI / 180;
+      const dLon = (lon2 - lon1) * Math.PI / 180;
+      const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+                Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+                Math.sin(dLon / 2) * Math.sin(dLon / 2);
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+      return R * c;
+    }
+
+    function calculateTrackStats(points) {
+      if (!points || points.length === 0) {
+        return { distNm: '0', maxSpd: '0.0', avgSpd: '0.0' };
+      }
+      let distKm = 0;
+      let maxSpd = 0;
+      let sumSpd = 0;
+      let spdCount = 0;
+
+      for (let i = 0; i < points.length; i++) {
+        const p = points[i];
+        const spd = parseFloat(p.speed) || 0;
+        if (spd > maxSpd) maxSpd = spd;
+        if (spd > 0) {
+          sumSpd += spd;
+          spdCount++;
+        }
+        if (i < points.length - 1) {
+          distKm += haversineKm(p.latitude, p.longitude, points[i + 1].latitude, points[i + 1].longitude);
+        }
+      }
+
+      const distNm = (distKm * 0.539957).toFixed(1);
+      const avgSpd = spdCount > 0 ? (sumSpd / spdCount).toFixed(1) : '0.0';
+      return { distNm, maxSpd: maxSpd.toFixed(1), avgSpd };
+    }
+
+    async function openTrackPanel(mmsi, color) {
+      currentTrackMmsi = mmsi;
+      const v = allVessels.find(x => String(x.mmsi) === String(mmsi)) || {};
+      currentTrackColor = color || categoryColors[v.category] || '#38bdf8';
+
+      const panel = document.getElementById('track-control-panel');
+      if (panel) panel.classList.remove('hidden');
+
+      document.getElementById('track-ship-name').textContent = v.name || 'Vessel';
+      document.getElementById('track-ship-category').textContent = v.category || '-';
+      document.getElementById('track-ship-mmsi').textContent = mmsi;
+
+      try {
+        const rangeRes = await fetch(`/api/history/${mmsi}/range`);
+        if (rangeRes.ok) {
+          const rangeData = await rangeRes.json();
+          if (rangeData.min_time && rangeData.max_time) {
+            const minClean = rangeData.min_time.replace(' ', 'T').slice(0, 16);
+            const maxClean = rangeData.max_time.replace(' ', 'T').slice(0, 16);
+            document.getElementById('track-input-start').value = minClean;
+            document.getElementById('track-input-end').value = maxClean;
+          }
+        }
+      } catch (e) {
+        console.error('Error fetching track range:', e);
+      }
+
+      setTrackPreset('all');
+    }
+
+    function closeTrackPanel() {
+      const panel = document.getElementById('track-control-panel');
+      if (panel) panel.classList.add('hidden');
+      if (activeTrackLayer) {
+        map.removeLayer(activeTrackLayer);
+        activeTrackLayer = null;
+      }
+      currentTrackMmsi = null;
+    }
+
+    function setTrackPreset(preset) {
+      currentTrackPreset = preset;
+      document.querySelectorAll('.track-preset-btn').forEach(btn => {
+        if (btn.getAttribute('data-preset') === preset) {
+          btn.className = 'track-preset-btn px-2.5 py-1 rounded-lg bg-blue-600 text-white text-[11px] font-semibold transition shrink-0';
+        } else {
+          btn.className = 'track-preset-btn px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] font-medium transition shrink-0';
+        }
+      });
+
+      const now = new Date();
+      let startStr = null;
+      let endStr = now.toISOString().slice(0, 16);
+
+      if (preset === '24h') {
+        const d = new Date(now.getTime() - 24 * 3600 * 1000);
+        startStr = d.toISOString().slice(0, 16);
+      } else if (preset === '7d') {
+        const d = new Date(now.getTime() - 7 * 24 * 3600 * 1000);
+        startStr = d.toISOString().slice(0, 16);
+      } else if (preset === '30d') {
+        const d = new Date(now.getTime() - 30 * 24 * 3600 * 1000);
+        startStr = d.toISOString().slice(0, 16);
+      } else if (preset === 'all') {
+        startStr = null;
+        endStr = null;
+      } else if (preset === 'custom') {
+        return;
+      }
+
+      if (startStr) document.getElementById('track-input-start').value = startStr;
+      if (endStr) document.getElementById('track-input-end').value = endStr;
+
+      loadAndRenderTrack(currentTrackMmsi, startStr, endStr);
+    }
+
+    function applyCustomTrackFilter() {
+      const start = document.getElementById('track-input-start').value;
+      const end = document.getElementById('track-input-end').value;
+      setTrackPreset('custom');
+      loadAndRenderTrack(currentTrackMmsi, start, end);
+    }
+
+    async function loadAndRenderTrack(mmsi, start, end) {
+      if (!mmsi) return;
+      if (activeTrackLayer) {
+        map.removeLayer(activeTrackLayer);
+        activeTrackLayer = null;
+      }
+
+      const badge = document.getElementById('track-points-badge');
+      if (badge) {
+        badge.textContent = 'Loading Route...';
+        badge.className = 'px-2.5 py-1 rounded-full text-xs font-mono font-bold bg-blue-500/10 text-blue-400 border border-blue-500/20 animate-pulse';
+      }
+
+      try {
+        let url = `/api/history/${mmsi}?limit=5000`;
+        if (start) url += `&start=${encodeURIComponent(start)}`;
+        if (end) url += `&end=${encodeURIComponent(end)}`;
+
+        const res = await fetch(url);
+        const data = await res.json();
+        const points = data.points || [];
+
+        if (badge) {
+          badge.classList.remove('animate-pulse');
+          badge.textContent = `${points.length} Waypoints`;
+          badge.className = points.length > 0 
+            ? 'px-2.5 py-1 rounded-full text-xs font-mono font-bold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
+            : 'px-2.5 py-1 rounded-full text-xs font-mono font-bold bg-slate-800 text-slate-400 border border-slate-700';
+        }
+
+        const stats = calculateTrackStats(points);
+        document.getElementById('stat-track-dist').textContent = `${stats.distNm} nm`;
+        document.getElementById('stat-track-max-spd').textContent = `${stats.maxSpd} kn`;
+        document.getElementById('stat-track-avg-spd').textContent = `${stats.avgSpd} kn`;
+
+        if (points.length === 0) {
+          showToast('No waypoints found for this timeframe.');
+          return;
+        }
+
+        activeTrackLayer = L.layerGroup().addTo(map);
+        const latlngs = points.map(p => [p.latitude, p.longitude]);
+
+        if (latlngs.length >= 2) {
+          L.polyline(latlngs, {
+            color: currentTrackColor || '#38bdf8',
+            weight: 3.5,
+            opacity: 0.85,
+            dashArray: '4, 8',
+            lineCap: 'round'
+          }).addTo(activeTrackLayer);
+        }
+
+        points.forEach((p, idx) => {
+          const isFirst = idx === 0;
+          const isLast = idx === points.length - 1;
+          const radius = (isFirst || isLast) ? 6 : 3;
+          const pointColor = isLast ? '#34d399' : (isFirst ? '#f87171' : (currentTrackColor || '#38bdf8'));
+
+          L.circleMarker([p.latitude, p.longitude], {
+            radius: radius,
+            color: pointColor,
+            fillColor: '#0f172a',
+            fillOpacity: 1,
+            weight: 2
+          }).addTo(activeTrackLayer).bindTooltip(`
+            <div class="text-xs font-sans space-y-0.5">
+              <div class="font-bold text-white">${p.timestamp}</div>
+              <div>Speed: <span class="font-mono text-cyan-400">${(parseFloat(p.speed) || 0).toFixed(1)} kn</span> • Course: <span class="font-mono">${p.course || 0}°</span></div>
+              ${p.status ? `<div class="text-slate-400 text-[10px]">${p.status}</div>` : ''}
+              ${isLast ? '<div class="text-[10px] text-emerald-400 font-bold">Latest Position</div>' : ''}
+              ${isFirst ? '<div class="text-[10px] text-rose-400 font-bold">Starting Point</div>' : ''}
+            </div>
+          `, { sticky: true });
+        });
+
+        if (latlngs.length > 0) {
+          map.fitBounds(latlngs, { padding: [60, 60], maxZoom: 11 });
+        }
+
+      } catch (e) {
+        console.error('Error rendering track:', e);
+        showToast('Error loading track: ' + e.message, true);
+      }
+    }
+
+    function updateMapMarkers() {
+      Object.values(markersMap).forEach(m => map.removeLayer(m));
+      markersMap = {};
+      const bounds = [];
+
+      allVessels.forEach(v => {
+        const pos = v.last_position;
+        if (pos && pos.latitude && pos.longitude) {
+          const lat = parseFloat(pos.latitude);
+          const lon = parseFloat(pos.longitude);
+          if (isNaN(lat) || isNaN(lon)) return;
+
+          const color = categoryColors[v.category] || '#38bdf8';
+          const heading = parseFloat(pos.heading || pos.course || 0);
+          const icon = createShipIcon(heading, color);
+
+          const marker = L.marker([lat, lon], { icon }).addTo(map);
+
+          const popupHtml = `
+            <div class="p-2 space-y-2 min-w-[240px]">
+              <div class="flex items-center justify-between border-b border-slate-700/80 pb-1.5">
+                <div>
+                  <h4 class="font-bold text-sm text-slate-100">${v.name}</h4>
+                  <div class="text-[11px] text-slate-400">
+                    ${v.callsign ? '<span class="text-blue-400 font-semibold">' + v.callsign + '</span> • ' : ''}
+                    ${v.class_name || v.category}
+                  </div>
+                </div>
+                <span class="px-2 py-0.5 rounded text-[10px] font-semibold" style="background: ${color}20; color: ${color}; border: 1px solid ${color}40;">
+                  ${v.category}
+                </span>
+              </div>
+              
+              <div class="grid grid-cols-2 gap-1.5 text-[11px] text-slate-300">
+                <div><span class="text-slate-500">MMSI:</span> <span class="mono">${v.mmsi}</span></div>
+                <div><span class="text-slate-500">Callsign:</span> <span class="mono">${v.callsign || '-'}</span></div>
+                <div><span class="text-slate-500">Status:</span> ${pos.navigationalStatus || 'Active'}</div>
+                <div><span class="text-slate-500">Speed:</span> ${(parseFloat(pos.speed) || 0).toFixed(1)} kn</div>
+                <div><span class="text-slate-500">Course / Hdg:</span> ${pos.course || 0}° / ${pos.heading || 0}°</div>
+                <div><span class="text-slate-500">Source:</span> ${pos.dataSource || 'AIS'}</div>
+              </div>
+
+              ${pos.destination ? `
+              <div class="text-[11px] bg-slate-800/80 p-1.5 rounded border border-slate-700/60">
+                <span class="text-slate-400">Destination:</span> <span class="font-medium text-slate-200">${pos.destination}</span>
+              </div>` : ''}
+
+              <div class="text-[10px] text-slate-400 flex items-center justify-between pt-1 border-t border-slate-800">
+                <span>Updated: ${pos.positionReceived || pos.fetched_at || 'Just now'}</span>
+              </div>
+
+              <button onclick="openTrackPanel('${v.mmsi}', '${color}')" class="w-full mt-2 py-1.5 px-2 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white rounded text-[11px] font-semibold transition flex items-center justify-center space-x-1.5 shadow-sm">
+                <span>🧭 Route & Voyage History</span>
+              </button>
+
+              <button onclick="refreshSingle('${v.mmsi}')" class="w-full mt-1.5 py-1 px-2 bg-slate-800/80 hover:bg-slate-700/80 border border-slate-700/60 rounded text-slate-300 hover:text-white text-[11px] font-medium transition flex items-center justify-center space-x-1">
+                <span>🔄 Query Position Now</span>
+              </button>
+            </div>
+          `;
+
+          marker.bindPopup(popupHtml);
+          marker.on('click', () => {
+            openTrackPanel(v.mmsi, color);
+          });
+          markersMap[v.mmsi] = marker;
+          bounds.push([lat, lon]);
+        }
+      });
+
+      if (bounds.length > 0 && !window.hasFittedBounds) {
+        map.fitBounds(bounds, { padding: [50, 50], maxZoom: 8 });
+        window.hasFittedBounds = true;
+      }
+    }
+
+    function renderVesselList() {
+      const container = document.getElementById('vessel-list');
+      const query = document.getElementById('search-input').value.toLowerCase().trim();
+
+      const filtered = allVessels.filter(v => {
+        const pos = v.last_position;
+        const hasPos = pos && pos.latitude && pos.longitude;
+        if (onlyActivePositions && !hasPos) return false;
+
+        const matchesCategory = (selectedCategory === 'ALL' || v.category === selectedCategory);
+        const text = `${v.name} ${v.callsign || ''} ${v.mmsi} ${v.class_name || ''} ${v.homeport || ''}`.toLowerCase();
+        const matchesQuery = !query || text.includes(query);
+        return matchesCategory && matchesQuery;
+      });
+
+      if (filtered.length === 0) {
+        container.innerHTML = '<div class="p-6 text-center text-xs text-slate-500">No vessels found.</div>';
+        return;
+      }
+
+      container.innerHTML = filtered.map(v => {
+        const color = categoryColors[v.category] || '#38bdf8';
+        const pos = v.last_position;
+        const hasPos = pos && pos.latitude && pos.longitude;
+        const speed = hasPos ? (parseFloat(pos.speed) || 0).toFixed(1) : null;
+        const status = hasPos ? (pos.navigationalStatus || 'Active') : 'No Position';
+
+        return `
+          <div onclick="focusVessel('${v.mmsi}')" class="group p-2.5 rounded-xl hover:bg-slate-800/80 cursor-pointer transition border border-transparent hover:border-slate-700/60 flex flex-col space-y-1.5">
+            <div class="flex items-center justify-between">
+              <div class="flex items-center space-x-2">
+                <span class="w-2.5 h-2.5 rounded-full shrink-0" style="background: ${hasPos ? color : '#475569'}"></span>
+                <span class="font-semibold text-xs text-slate-100 group-hover:text-blue-400 transition">${v.name}</span>
+                ${v.callsign ? `<span class="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 mono">${v.callsign}</span>` : ''}
+              </div>
+              <span class="text-[10px] px-2 py-0.5 rounded font-medium" style="background: ${color}15; color: ${color};">
+                ${v.category}
+              </span>
+            </div>
+
+            <div class="flex items-center justify-between text-[11px] text-slate-400 pl-4.5">
+              <span class="${hasPos ? 'text-slate-300' : 'text-slate-600'}">${status} ${speed !== null ? '• ' + speed + ' kn' : ''}</span>
+              <div class="flex items-center space-x-1.5 opacity-0 group-hover:opacity-100 transition" onclick="event.stopPropagation()">
+                <button onclick="refreshSingle('${v.mmsi}')" title="Refresh" class="p-1 hover:text-blue-400 text-slate-400">
+                  <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+                </button>
+                <button onclick="deleteVessel('${v.mmsi}')" title="Delete" class="p-1 hover:text-rose-400 text-slate-500">
+                  <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+                </button>
+              </div>
+            </div>
+
+            ${pos && pos.destination ? `
+              <div class="text-[10px] text-slate-500 truncate pl-4.5">
+                ➡️ ${pos.destination}
+              </div>
+            ` : ''}
+          </div>
+        `;
+      }).join('');
+    }
+
+    function focusVessel(mmsi) {
+      const v = allVessels.find(x => String(x.mmsi) === String(mmsi));
+      const marker = markersMap[mmsi];
+      const color = (v && categoryColors[v.category]) || '#38bdf8';
+
+      if (marker && v) {
+        map.setView(marker.getLatLng(), 11, { animate: true });
+        marker.openPopup();
+        openTrackPanel(mmsi, color);
+      } else if (v) {
+        openTrackPanel(mmsi, color);
+      } else {
+        showToast('Vessel not found.');
+      }
+    }
+
+    function setCategory(cat) {
+      selectedCategory = cat;
+      document.querySelectorAll('.cat-pill').forEach(btn => {
+        if (btn.getAttribute('data-cat') === cat) {
+          btn.className = 'cat-pill px-2 py-0.5 rounded-md font-medium transition bg-blue-600 text-white';
+        } else {
+          btn.className = 'cat-pill px-2 py-0.5 rounded-md font-medium transition bg-slate-800 text-slate-400 hover:text-slate-200';
+        }
+      });
+      renderVesselList();
+    }
+
+    function filterVessels() {
+      renderVesselList();
+    }
+
+    async function refreshSingle(mmsi) {
+      try {
+        const res = await fetch(`/api/refresh/${mmsi}`, { method: 'POST' });
+        const data = await res.json();
+        if (res.ok) {
+          await loadVessels();
+          const marker = markersMap[mmsi];
+          if (marker) marker.openPopup();
+          if (data.updated === false) {
+            showToast('No new position reported (vessel in port or transponder silent)');
+          } else {
+            showToast('Position updated');
+          }
+        } else {
+          showToast(data.message || 'No new position available');
+        }
+      } catch (e) {
+        showToast('Network error', true);
+      }
+    }
+
+    async function refreshAll() {
+      try {
+        await fetch('/api/refresh-all', { method: 'POST' });
+        pollStatus();
+        showToast('Fleet update started...');
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    let pollInterval = null;
+    function pollStatus() {
+      if (pollInterval) clearInterval(pollInterval);
+      pollInterval = setInterval(async () => {
+        const res = await fetch('/api/status');
+        const data = await res.json();
+        checkProgress(data.refresh_state);
+        if (!data.refresh_state.is_refreshing) {
+          clearInterval(pollInterval);
+          pollInterval = null;
+          loadVessels();
+        }
+      }, 1000);
+    }
+
+    function checkProgress(state) {
+      const container = document.getElementById('refresh-progress-container');
+      const bar = document.getElementById('progress-bar');
+      const text = document.getElementById('progress-text');
+      const pct = document.getElementById('progress-pct');
+      const btn = document.getElementById('btn-refresh-all');
+      const icon = document.getElementById('icon-refresh');
+      const streamBadge = document.getElementById('badge-stream');
+
+      if (streamBadge && state) {
+        if (state.aisstream_connected) {
+          streamBadge.className = 'flex items-center space-x-1 px-1.5 py-0.5 rounded text-[10px] bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-medium';
+          streamBadge.innerHTML = '<span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span><span>AISStream Live</span>';
+        } else {
+          streamBadge.className = 'flex items-center space-x-1 px-1.5 py-0.5 rounded text-[10px] bg-slate-800 text-slate-500 border border-slate-700 font-medium';
+          streamBadge.innerHTML = '<span class="w-1.5 h-1.5 rounded-full bg-slate-500"></span><span>Stream Idle</span>';
+        }
+      }
+
+      if (state && state.is_refreshing) {
+        container.classList.remove('hidden');
+        const percent = Math.round((state.current / (state.total || 1)) * 100);
+        bar.style.width = percent + '%';
+        text.textContent = `Updating ${state.current} / ${state.total}...`;
+        pct.textContent = percent + '%';
+        btn.disabled = true;
+        btn.classList.add('opacity-50');
+        icon.classList.add('animate-spin');
+      } else {
+        container.classList.add('hidden');
+        btn.disabled = false;
+        btn.classList.remove('opacity-50');
+        icon.classList.remove('animate-spin');
+      }
+    }
+
+    async function deleteVessel(mmsi) {
+      if (!confirm('Remove vessel from fleet?')) return;
+      await fetch(`/api/vessels/${mmsi}`, { method: 'DELETE' });
+      await loadVessels();
+    }
+
+    function openAddModal() { document.getElementById('modal-add').classList.remove('hidden'); }
+    function closeAddModal() { document.getElementById('modal-add').classList.add('hidden'); }
+
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        closeSettingsModal();
+        closeAddModal();
+      }
+    });
+
+    async function submitAddVessel(e) {
+      e.preventDefault();
+      const body = {
+        mmsi: document.getElementById('add-mmsi').value.trim(),
+        name: document.getElementById('add-name').value.trim(),
+        callsign: document.getElementById('add-callsign').value.trim(),
+        category: document.getElementById('add-category').value,
+        class_name: document.getElementById('add-class').value.trim(),
+        homeport: document.getElementById('add-homeport').value.trim()
+      };
+      const res = await fetch('/api/vessels', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      if (res.ok) {
+        closeAddModal();
+        e.target.reset();
+        await loadVessels();
+        showToast('Vessel added successfully');
+      } else {
+        const err = await res.json();
+        alert('Error: ' + (err.detail || 'Could not save vessel'));
+      }
+    }
+
+    let refreshIntervalMinutes = 10;
+    let secondsUntilNextRefresh = 600;
+    let timerInterval = null;
+
+    function formatTime(sec) {
+      const m = Math.floor(sec / 60);
+      const s = sec % 60;
+      return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+    }
+
+    function startRefreshTimer(minutes) {
+      if (timerInterval) clearInterval(timerInterval);
+      refreshIntervalMinutes = Math.max(1, Math.min(120, parseInt(minutes) || 10));
+      
+      const badge = document.getElementById('badge-timer');
+      if (badge) badge.classList.remove('hidden');
+      secondsUntilNextRefresh = refreshIntervalMinutes * 60;
+      document.getElementById('timer-countdown').textContent = formatTime(secondsUntilNextRefresh);
+
+      timerInterval = setInterval(() => {
+        secondsUntilNextRefresh--;
+        if (secondsUntilNextRefresh <= 0) {
+          secondsUntilNextRefresh = refreshIntervalMinutes * 60;
+          loadVessels();
+        }
+        document.getElementById('timer-countdown').textContent = formatTime(secondsUntilNextRefresh);
+      }, 1000);
+    }
+
+    function onSliderChange(val) {
+      const v = Math.max(1, Math.min(120, parseInt(val) || 1));
+      const label = document.getElementById('slider-label');
+      label.textContent = `${v} Min`;
+      label.className = 'px-2 py-0.5 rounded bg-blue-600/20 text-blue-400 font-semibold mono text-xs border border-blue-500/30';
+    }
+
+    async function openSettingsModal() {
+      const res = await fetch('/api/status');
+      const data = await res.json();
+      const cfg = data.config || {};
+      
+      const interval = Math.max(1, Math.min(120, cfg.refresh_interval_minutes !== undefined ? cfg.refresh_interval_minutes : 10));
+      document.getElementById('settings-interval').value = interval;
+      onSliderChange(interval);
+      document.getElementById('settings-daily').checked = !!cfg.auto_refresh_daily;
+
+      document.getElementById('modal-settings').classList.remove('hidden');
+    }
+
+    function closeSettingsModal() { document.getElementById('modal-settings').classList.add('hidden'); }
+
+    async function submitSettings(e) {
+      e.preventDefault();
+      const intervalVal = Math.max(1, Math.min(120, parseInt(document.getElementById('settings-interval').value) || 10));
+      const body = {
+        refresh_interval_minutes: intervalVal,
+        auto_refresh_daily: document.getElementById('settings-daily').checked
+      };
+
+      const k1 = document.getElementById('settings-key').value.trim();
+      const k2 = document.getElementById('settings-aisstream').value.trim();
+      if (k1) body.api_key = k1;
+      if (k2) body.aisstream_key = k2;
+
+      await fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      startRefreshTimer(intervalVal);
+      closeSettingsModal();
+      showToast('Settings saved successfully');
+    }
+
+    // Initial load
+    loadVessels().then(async () => {
+      try {
+        const res = await fetch('/api/status');
+        const data = await res.json();
+        const interval = data.config && data.config.refresh_interval_minutes !== undefined ? data.config.refresh_interval_minutes : 10;
+        startRefreshTimer(interval);
+      } catch (e) {
+        startRefreshTimer(10);
+      }
+    });
+  </script>
+</body>
+</html>

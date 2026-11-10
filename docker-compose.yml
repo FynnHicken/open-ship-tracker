@@ -1,0 +1,13 @@
+services:
+  open-ship-tracker:
+    build: .
+    container_name: open-ship-tracker
+    restart: unless-stopped
+    ports:
+      - "8050:8050"
+    environment:
+      - DATA_DIR=/data
+      - AISSTREAM_API_KEY=${AISSTREAM_API_KEY:-}
+      - DATADOCKED_API_KEY=${DATADOCKED_API_KEY:-}
+    volumes:
+      - ./data:/data

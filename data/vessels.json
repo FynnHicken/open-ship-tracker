@@ -1,0 +1,83 @@
+[
+  {
+    "mmsi": "211202710",
+    "name": "Polarstern",
+    "callsign": "DBLK",
+    "category": "Forschung",
+    "class_name": "Forschungseisbrecher",
+    "homeport": "Bremerhaven",
+    "status": "Aktiv"
+  },
+  {
+    "mmsi": "211655000",
+    "name": "Sonne",
+    "callsign": "DBBE",
+    "category": "Forschung",
+    "class_name": "Tiefsee-Forschungsschiff",
+    "homeport": "Wilhelmshaven",
+    "status": "Aktiv"
+  },
+  {
+    "mmsi": "211206980",
+    "name": "Meteor",
+    "callsign": "DBBH",
+    "category": "Forschung",
+    "class_name": "Forschungsschiff",
+    "homeport": "Hamburg",
+    "status": "Aktiv"
+  },
+  {
+    "mmsi": "211476000",
+    "name": "Maria S. Merian",
+    "callsign": "DBBT",
+    "category": "Forschung",
+    "class_name": "Eisrand-Forschungsschiff",
+    "homeport": "Rostock",
+    "status": "Aktiv"
+  },
+  {
+    "mmsi": "211550000",
+    "name": "Alexander von Humboldt II",
+    "callsign": "DDKK2",
+    "category": "Segler",
+    "class_name": "Dreimast-Bark",
+    "homeport": "Bremerhaven",
+    "status": "Aktiv"
+  },
+  {
+    "mmsi": "211210200",
+    "name": "Gorch Fock",
+    "callsign": "DRAX",
+    "category": "Segler",
+    "class_name": "Dreimast-Bark",
+    "homeport": "Kiel",
+    "status": "Aktiv"
+  },
+  {
+    "mmsi": "211283620",
+    "name": "Neuwerk",
+    "callsign": "DBKS",
+    "category": "Behörde",
+    "class_name": "Mehrzweckschiff",
+    "homeport": "Cuxhaven",
+    "status": "Aktiv"
+  },
+  {
+    "mmsi": "211311090",
+    "name": "Arkona",
+    "callsign": "DBBU",
+    "category": "Behörde",
+    "class_name": "Mehrzweckschiff",
+    "homeport": "Warnemünde",
+    "status": "Aktiv"
+  },
+  {
+    "mmsi": "211389880",
+    "name": "Hermann Marwede",
+    "callsign": "DBAR",
+    "category": "Rettung",
+    "class_name": "Seenotrettungskreuzer 46m",
+    "homeport": "Helgoland",
+    "status": "Aktiv"
+  }
+]
