@@ -76,6 +76,59 @@ def safe_float(val, default=0.0):
     except:
         return default
 
+def normalize_iso_timestamp(ts_val) -> Optional[str]:
+    """Converts various AIS timestamp formats into strict ISO-8601 UTC (YYYY-MM-DDTHH:MM:SSZ)."""
+    if not ts_val:
+        return None
+    s = str(ts_val).strip()
+    if not s:
+        return None
+    m = re.match(r'^(\d{4}-\d{2}-\d{2})[T\s](\d{2}:\d{2}:\d{2})(?:\.\d+)?(?:\s*\+00:?00(?:\s*UTC)?|Z)?$', s)
+    if m:
+        return f"{m.group(1)}T{m.group(2)}Z"
+    try:
+        clean_dd = re.sub(r'\s+UTC$', '', s)
+        dt = datetime.strptime(clean_dd, "%b %d, %Y %H:%M")
+        return dt.strftime("%Y-%m-%dT%H:%M:00Z")
+    except:
+        pass
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except:
+        pass
+    return s
+
+def normalize_position_dict(pos: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Ensures all timestamp, status, and source fields are consistently populated in ISO-8601 format."""
+    if not pos or not isinstance(pos, dict):
+        return pos
+    raw_ts = (
+        pos.get("positionReceived")
+        or pos.get("updateTime")
+        or pos.get("timestamp")
+        or pos.get("last_pos_Time")
+        or pos.get("fetched_at")
+    )
+    iso_ts = normalize_iso_timestamp(raw_ts)
+    if iso_ts:
+        pos["timestamp"] = iso_ts
+        pos["positionReceived"] = iso_ts
+        pos["updateTime"] = iso_ts
+        if not pos.get("fetched_at"):
+            pos["fetched_at"] = iso_ts
+        else:
+            pos["fetched_at"] = normalize_iso_timestamp(pos["fetched_at"]) or iso_ts
+
+    stat = pos.get("navigationalStatus") or pos.get("status") or "Active (AIS)"
+    pos["status"] = stat
+    pos["navigationalStatus"] = stat
+
+    src = pos.get("dataSource") or pos.get("source") or "AIS"
+    pos["source"] = src
+    pos["dataSource"] = src
+    return pos
+
 # --- SQLITE ARCHIVE DATABASE ---
 def init_db():
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -107,8 +160,9 @@ def record_position_to_archive(mmsi: str, lat, lon, speed=None, course=None, hea
     f_course = safe_float(course, None)
     f_heading = safe_float(heading, None)
 
+    timestamp = normalize_iso_timestamp(timestamp)
     if not timestamp:
-        timestamp = datetime.now(timezone.utc).isoformat()
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cur = conn.cursor()
@@ -162,7 +216,22 @@ def get_track_history(
             
             cur.execute(query, params)
             rows = cur.fetchall()
-            return [dict(r) for r in rows]
+            result = []
+            for r in rows:
+                d = dict(r)
+                iso_ts = normalize_iso_timestamp(d.get("timestamp"))
+                if iso_ts:
+                    d["timestamp"] = iso_ts
+                    d["positionReceived"] = iso_ts
+                    d["updateTime"] = iso_ts
+                stat = d.get("status") or "Active (AIS)"
+                d["status"] = stat
+                d["navigationalStatus"] = stat
+                src = d.get("source") or "AIS"
+                d["source"] = src
+                d["dataSource"] = src
+                result.append(d)
+            return result
     except Exception as e:
         logger.error(f"Error fetching track history: {e}")
         return []
@@ -212,6 +281,9 @@ def load_vessels() -> List[Dict[str, Any]]:
             if str(s.get("mmsi")) not in existing_mmsi:
                 vessels.append(s)
                 changed = True
+        for v in vessels:
+            if v.get("last_position"):
+                normalize_position_dict(v["last_position"])
         if changed:
             save_vessels(vessels)
         return vessels
@@ -330,15 +402,20 @@ async def aisstream_listener():
                             stat_text = NAV_STATUS_MAP.get(nav_stat, "Active (AIS)")
 
                             if lat is not None and lon is not None:
+                                iso_time = normalize_iso_timestamp(meta.get("time_utc")) or now_iso
                                 pos["latitude"] = str(lat)
                                 pos["longitude"] = str(lon)
                                 pos["speed"] = str(sog) if sog is not None else "0.0"
                                 pos["course"] = str(cog) if cog is not None else "0"
                                 pos["heading"] = str(hdg) if hdg is not None and hdg < 511 else str(cog or 0)
+                                pos["status"] = stat_text
                                 pos["navigationalStatus"] = stat_text
+                                pos["source"] = "AISStream Live"
                                 pos["dataSource"] = "AISStream Live"
-                                pos["positionReceived"] = meta.get("time_utc") or now_iso
-                                pos["fetched_at"] = now_iso
+                                pos["timestamp"] = iso_time
+                                pos["positionReceived"] = iso_time
+                                pos["updateTime"] = iso_time
+                                pos["fetched_at"] = normalize_iso_timestamp(now_iso) or iso_time
                                 save_vessels(current_vessels)
 
                                 record_position_to_archive(
@@ -350,7 +427,7 @@ async def aisstream_listener():
                                     heading=float(hdg) if hdg is not None else None,
                                     status=stat_text,
                                     destination=pos.get("destination"),
-                                    timestamp=meta.get("time_utc") or now_iso,
+                                    timestamp=iso_time,
                                     source="AISStream Live"
                                 )
                                 logger.info(f"Live AIS: {target.get('name')} ({mmsi}) @ {lat}, {lon}")
@@ -569,23 +646,26 @@ async def update_settings(req: SettingsRequest):
 async def startup_event():
     init_db()
     
-    # Preload positions from seed/vessels.json into archive
+    # Preload positions from seed/vessels.json into archive (only if valid timestamp exists)
     vessels = load_vessels()
     for v in vessels:
         pos = v.get("last_position")
         if pos and pos.get("latitude") and pos.get("longitude"):
-            record_position_to_archive(
-                mmsi=v.get("mmsi"),
-                lat=pos.get("latitude"),
-                lon=pos.get("longitude"),
-                speed=pos.get("speed"),
-                course=pos.get("course"),
-                heading=pos.get("heading"),
-                status=pos.get("navigationalStatus"),
-                destination=pos.get("destination"),
-                timestamp=pos.get("positionReceived") or pos.get("fetched_at"),
-                source=pos.get("dataSource") or "Archive"
-            )
+            normalize_position_dict(pos)
+            ts = pos.get("timestamp") or pos.get("positionReceived") or pos.get("updateTime") or pos.get("fetched_at")
+            if ts:
+                record_position_to_archive(
+                    mmsi=v.get("mmsi"),
+                    lat=pos.get("latitude"),
+                    lon=pos.get("longitude"),
+                    speed=pos.get("speed"),
+                    course=pos.get("course"),
+                    heading=pos.get("heading"),
+                    status=pos.get("navigationalStatus") or pos.get("status"),
+                    destination=pos.get("destination"),
+                    timestamp=ts,
+                    source=pos.get("dataSource") or pos.get("source") or "Archive"
+                )
 
     asyncio.create_task(aisstream_listener())
 
