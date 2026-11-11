@@ -64,6 +64,7 @@ class VesselAddRequest(BaseModel):
 
 class SettingsRequest(BaseModel):
     auto_refresh_daily: bool
+    show_historical_data: Optional[bool] = False
     refresh_interval_minutes: Optional[int] = 10
     api_key: Optional[str] = None
     aisstream_key: Optional[str] = None
@@ -299,6 +300,7 @@ def save_vessels(data: List[Dict[str, Any]]):
 def load_config() -> Dict[str, Any]:
     default_cfg = {
         "auto_refresh_daily": False,
+        "show_historical_data": False,
         "refresh_interval_minutes": 10,
         "api_key": API_KEY,
         "aisstream_key": AISSTREAM_KEY
@@ -515,13 +517,40 @@ async def run_refresh_all_task():
 
 # --- API ENDPOINTS ---
 @app.get("/api/vessels")
-async def get_vessels():
+async def get_vessels(include_historical: Optional[bool] = None):
+    cfg = load_config()
+    show_hist = include_historical if include_historical is not None else bool(cfg.get("show_historical_data", False))
     vessels = load_vessels()
-    with_pos = sum(1 for v in vessels if v.get("last_position") and v["last_position"].get("latitude"))
+    now_utc = datetime.now(timezone.utc)
+    result_vessels = []
+    for v in vessels:
+        v_copy = dict(v)
+        pos = v_copy.get("last_position")
+        if pos and pos.get("latitude") and pos.get("longitude"):
+            pos_copy = dict(pos)
+            ts_str = pos_copy.get("timestamp") or pos_copy.get("positionReceived") or pos_copy.get("updateTime")
+            age_days = 0.0
+            if ts_str:
+                try:
+                    dt = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00"))
+                    age_days = (now_utc - dt).total_seconds() / 86400.0
+                except:
+                    age_days = 999.0
+            pos_copy["age_days"] = round(age_days, 2)
+            pos_copy["is_historical"] = age_days > 7.0
+            if not show_hist and age_days > 7.0:
+                v_copy["archived_position"] = pos_copy
+                v_copy["last_position"] = None
+            else:
+                v_copy["last_position"] = pos_copy
+        result_vessels.append(v_copy)
+
+    with_pos = sum(1 for v in result_vessels if v.get("last_position") and v["last_position"].get("latitude"))
     return {
-        "vessels": vessels,
-        "total": len(vessels),
+        "vessels": result_vessels,
+        "total": len(result_vessels),
         "with_position": with_pos,
+        "show_historical_data": show_hist,
         "refresh_state": refresh_state
     }
 
@@ -623,6 +652,7 @@ async def get_status():
     # Mask API keys in public status output
     safe_cfg = {
         "auto_refresh_daily": cfg.get("auto_refresh_daily", False),
+        "show_historical_data": cfg.get("show_historical_data", False),
         "refresh_interval_minutes": cfg.get("refresh_interval_minutes", 10),
         "has_api_key": bool(cfg.get("api_key")),
         "has_aisstream_key": bool(cfg.get("aisstream_key"))
@@ -633,6 +663,8 @@ async def get_status():
 async def update_settings(req: SettingsRequest):
     cfg = load_config()
     cfg["auto_refresh_daily"] = req.auto_refresh_daily
+    if req.show_historical_data is not None:
+        cfg["show_historical_data"] = bool(req.show_historical_data)
     if req.refresh_interval_minutes is not None:
         cfg["refresh_interval_minutes"] = max(1, min(120, req.refresh_interval_minutes))
     if req.api_key is not None:
