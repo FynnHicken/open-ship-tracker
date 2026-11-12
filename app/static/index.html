@@ -841,18 +841,55 @@
       const angle = (heading !== undefined && heading !== null && !isNaN(heading)) ? heading : 0;
       const isMoving = (parseFloat(speed) || 0) >= 0.5;
       const svg = isMoving
-        ? `<svg width="22" height="22" viewBox="0 0 32 32" style="transform: rotate(${angle}deg); transform-origin: center;">
-             <path d="M16 3 L24 25 L16 21 L8 25 Z" fill="${color}" stroke="#0f172a" stroke-width="2" stroke-linejoin="round" />
+        ? `<svg width="24" height="24" viewBox="0 0 32 32" style="transform: rotate(${angle}deg); transform-origin: center; filter: drop-shadow(0 2px 4px rgba(0,0,0,0.8));">
+             <path d="M16 2 C20 7 21 14 21 27 L11 27 C11 14 12 7 16 2 Z" fill="${color}" stroke="#0f172a" stroke-width="1.8" stroke-linejoin="round" />
+             <rect x="13.5" y="15" width="5" height="5" rx="1" fill="#0f172a" opacity="0.6" />
            </svg>`
-        : `<svg width="16" height="16" viewBox="0 0 24 24">
+        : `<svg width="16" height="16" viewBox="0 0 24 24" style="filter: drop-shadow(0 1px 3px rgba(0,0,0,0.8));">
              <circle cx="12" cy="12" r="6" fill="${color}" stroke="#0f172a" stroke-width="2" />
            </svg>`;
       return L.divIcon({
         className: 'ship-marker',
         html: svg,
-        iconSize: isMoving ? [22, 22] : [16, 16],
-        iconAnchor: isMoving ? [11, 11] : [8, 8],
-        popupAnchor: [0, -10]
+        iconSize: isMoving ? [24, 24] : [16, 16],
+        iconAnchor: isMoving ? [12, 12] : [8, 8],
+        popupAnchor: [0, -12]
+      });
+    }
+
+    let hullsMap = {};
+
+    function getHullPolygonLatLngs(lat, lon, length, width, headingDeg) {
+      const rad = ((headingDeg !== undefined && headingDeg !== null && !isNaN(headingDeg)) ? headingDeg : 0) * (Math.PI / 180);
+      const sinH = Math.sin(rad);
+      const cosH = Math.cos(rad);
+
+      const len = Math.max(12, Math.min(450, parseFloat(length) || 85));
+      const wid = Math.max(3, Math.min(65, parseFloat(width) || (len * 0.16)));
+
+      const halfL = len / 2.0;
+      const halfW = wid / 2.0;
+      const bowTrans = halfL * 0.45; // Übergang zur Bugspitze
+
+      // Lokale Punkte (Meter relativ zum Schiffszentrum: +y = Bug, +x = Steuerbord)
+      const localPts = [
+        [0, halfL],          // 1. Bugspitze
+        [halfW, bowTrans],   // 2. Steuerbord-Bug
+        [halfW, -halfL],     // 3. Steuerbord-Heck
+        [-halfW, -halfL],    // 4. Backbord-Heck
+        [-halfW, bowTrans]   // 5. Backbord-Bug
+      ];
+
+      const mPerDegLat = 111132.0;
+      const mPerDegLon = 111132.0 * Math.cos(lat * (Math.PI / 180));
+
+      return localPts.map(([x, y]) => {
+        const dEast = x * cosH + y * sinH;
+        const dNorth = -x * sinH + y * cosH;
+        return [
+          lat + (dNorth / mPerDegLat),
+          lon + (dEast / mPerDegLon)
+        ];
       });
     }
 
@@ -1060,6 +1097,8 @@
       const renderList = visibleVessels.slice(0, 300);
       const renderSet = new Set(renderList.map(v => v.mmsi));
 
+      const isZoomedIn = map.getZoom() >= 14;
+
       // Remove old markers not in visible set
       Object.keys(markersMap).forEach(mmsi => {
         if (!renderSet.has(mmsi)) {
@@ -1068,9 +1107,37 @@
         }
       });
 
+      // Remove old hull polygons not in visible set or when zoomed out
+      Object.keys(hullsMap).forEach(mmsi => {
+        if (!isZoomedIn || !renderSet.has(mmsi)) {
+          map.removeLayer(hullsMap[mmsi]);
+          delete hullsMap[mmsi];
+        }
+      });
+
       renderList.forEach(v => {
         const color = categoryColors[v.category] || '#94a3b8';
         const hdg = v.heading != null ? v.heading : (v.course || 0);
+
+        // Maßstabsgetreuer Schiffsrumpf (True-Scale Hull Polygon) bei hohem Zoom
+        if (isZoomedIn) {
+          const hullPts = getHullPolygonLatLngs(v.latitude, v.longitude, v.length, v.width, hdg);
+          if (hullsMap[v.mmsi]) {
+            hullsMap[v.mmsi].setLatLngs(hullPts);
+            hullsMap[v.mmsi].setStyle({ color: '#020617', fillColor: color });
+          } else {
+            const poly = L.polygon(hullPts, {
+              color: '#020617',
+              weight: 1.5,
+              fillColor: color,
+              fillOpacity: 0.85,
+              interactive: true
+            }).addTo(map);
+            poly.bindPopup(() => getVesselPopupHtml(v));
+            poly.on('click', () => openTrack(v.mmsi));
+            hullsMap[v.mmsi] = poly;
+          }
+        }
 
         if (markersMap[v.mmsi]) {
           const m = markersMap[v.mmsi];
