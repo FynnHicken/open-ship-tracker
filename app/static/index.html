@@ -485,10 +485,10 @@
         </div>
       </div>
 
-      <!-- Tabs für Anmelden / Registrieren (nur sichtbar wenn Nutzer existieren) -->
+      <!-- Tabs für Anmelden / Registrieren -->
       <div id="auth-tabs" class="flex rounded-lg bg-slate-950 p-1 border border-slate-800 text-xs">
-        <button id="tab-login" onclick="switchAuthTab('login')" class="flex-1 py-1.5 rounded-md font-semibold text-white bg-blue-600 transition">Anmelden</button>
-        <button id="tab-register" onclick="switchAuthTab('register')" class="flex-1 py-1.5 rounded-md font-medium text-slate-400 hover:text-slate-200 transition">Registrieren</button>
+        <button type="button" id="tab-login" onclick="switchAuthTab('login')" class="flex-1 py-1.5 rounded-md font-semibold text-white bg-blue-600 transition">Anmelden</button>
+        <button type="button" id="tab-register" onclick="switchAuthTab('register')" class="flex-1 py-1.5 rounded-md font-medium text-slate-400 hover:text-slate-200 transition">Registrieren</button>
       </div>
 
       <form onsubmit="handleAuthSubmit(event)" class="space-y-3 text-xs">
@@ -500,6 +500,11 @@
         <div>
           <label class="block text-slate-400 mb-1 font-medium">Passwort</label>
           <input id="auth-password" type="password" required placeholder="Mindestens 6 Zeichen" minlength="6" autocomplete="current-password" class="w-full p-2.5 bg-slate-950 border border-slate-800 rounded-lg text-slate-200 focus:outline-none focus:border-blue-500 font-mono" />
+        </div>
+
+        <div id="auth-confirm-row" class="hidden">
+          <label class="block text-slate-400 mb-1 font-medium">Passwort wiederholen</label>
+          <input id="auth-password-confirm" type="password" placeholder="Passwort erneut eingeben" minlength="6" autocomplete="new-password" class="w-full p-2.5 bg-slate-950 border border-slate-800 rounded-lg text-slate-200 focus:outline-none focus:border-blue-500 font-mono" />
         </div>
 
         <div id="auth-error" class="hidden text-[11px] text-rose-400 font-medium p-2 bg-rose-500/10 border border-rose-500/20 rounded-lg"></div>
@@ -1655,19 +1660,21 @@
       const banner = document.getElementById('auth-setup-banner');
       const tabs = document.getElementById('auth-tabs');
       const errBox = document.getElementById('auth-error');
-      const submitBtn = document.getElementById('auth-submit-btn');
       if (errBox) errBox.classList.add('hidden');
 
       if (isFirstSetup) {
         if (banner) banner.classList.remove('hidden');
-        if (tabs) tabs.classList.add('hidden');
-        if (submitBtn) submitBtn.textContent = 'Administrator-Konto anlegen & Starten';
-        currentAuthTab = 'register';
+        if (tabs) tabs.classList.remove('hidden');
+        const loginTab = document.getElementById('tab-login');
+        if (loginTab) loginTab.classList.add('hidden');
+        switchAuthTab('register');
       } else {
         if (banner) banner.classList.add('hidden');
         if (tabs) {
           tabs.classList.remove('hidden');
+          const loginTab = document.getElementById('tab-login');
           const regTab = document.getElementById('tab-register');
+          if (loginTab) loginTab.classList.remove('hidden');
           if (regTab) {
             if (!registrationEnabled) regTab.classList.add('hidden');
             else regTab.classList.remove('hidden');
@@ -1688,17 +1695,29 @@
       const btnLogin = document.getElementById('tab-login');
       const btnReg = document.getElementById('tab-register');
       const submitBtn = document.getElementById('auth-submit-btn');
+      const confirmRow = document.getElementById('auth-confirm-row');
+      const confirmInput = document.getElementById('auth-password-confirm');
       const errBox = document.getElementById('auth-error');
+      const title = document.getElementById('auth-title');
+      const subtitle = document.getElementById('auth-subtitle');
       if (errBox) errBox.classList.add('hidden');
 
       if (tab === 'login') {
-        btnLogin.className = 'flex-1 py-1.5 rounded-md font-semibold text-white bg-blue-600 transition';
-        btnReg.className = 'flex-1 py-1.5 rounded-md font-medium text-slate-400 hover:text-slate-200 transition';
+        if (btnLogin) btnLogin.className = 'flex-1 py-1.5 rounded-md font-semibold text-white bg-blue-600 transition';
+        if (btnReg) btnReg.className = 'flex-1 py-1.5 rounded-md font-medium text-slate-400 hover:text-slate-200 transition';
+        if (confirmRow) confirmRow.classList.add('hidden');
+        if (confirmInput) confirmInput.required = false;
         if (submitBtn) submitBtn.textContent = 'Anmelden';
+        if (title) title.textContent = 'OpenShipTracker';
+        if (subtitle) subtitle.textContent = 'Privates AIS Live Radar & Flottenmonitor';
       } else {
-        btnReg.className = 'flex-1 py-1.5 rounded-md font-semibold text-white bg-blue-600 transition';
-        btnLogin.className = 'flex-1 py-1.5 rounded-md font-medium text-slate-400 hover:text-slate-200 transition';
-        if (submitBtn) submitBtn.textContent = 'Konto registrieren';
+        if (btnReg) btnReg.className = 'flex-1 py-1.5 rounded-md font-semibold text-white bg-blue-600 transition';
+        if (btnLogin) btnLogin.className = 'flex-1 py-1.5 rounded-md font-medium text-slate-400 hover:text-slate-200 transition';
+        if (confirmRow) confirmRow.classList.remove('hidden');
+        if (confirmInput) confirmInput.required = true;
+        if (submitBtn) submitBtn.textContent = !hasRegisteredUsers ? 'Administrator-Konto anlegen & Starten' : 'Konto registrieren';
+        if (title) title.textContent = !hasRegisteredUsers ? 'Ersteinrichtung' : 'Neues Konto registrieren';
+        if (subtitle) subtitle.textContent = !hasRegisteredUsers ? 'Administrator-Account anlegen' : 'Wähle Benutzername und Passwort';
       }
     }
 
@@ -1706,8 +1725,33 @@
       e.preventDefault();
       const username = document.getElementById('auth-username').value.trim();
       const password = document.getElementById('auth-password').value;
+      const confirmInput = document.getElementById('auth-password-confirm');
       const errBox = document.getElementById('auth-error');
       if (errBox) errBox.classList.add('hidden');
+
+      if (currentAuthTab === 'register') {
+        if (username.length < 3) {
+          if (errBox) {
+            errBox.textContent = 'Der Benutzername muss mindestens 3 Zeichen lang sein.';
+            errBox.classList.remove('hidden');
+          }
+          return;
+        }
+        if (password.length < 6) {
+          if (errBox) {
+            errBox.textContent = 'Das Passwort muss mindestens 6 Zeichen lang sein.';
+            errBox.classList.remove('hidden');
+          }
+          return;
+        }
+        if (confirmInput && confirmInput.value && password !== confirmInput.value) {
+          if (errBox) {
+            errBox.textContent = 'Die Passwörter stimmen nicht überein.';
+            errBox.classList.remove('hidden');
+          }
+          return;
+        }
+      }
 
       const endpoint = currentAuthTab === 'register' ? '/api/auth/register' : '/api/auth/login';
       const payload = { username, password };
@@ -1723,6 +1767,7 @@
           throw new Error(data.detail || 'Fehler bei der Authentifizierung.');
         }
         currentUser = data.user;
+        hasRegisteredUsers = true;
         hideAuthModal();
         renderUserBadge();
         showToast(`Willkommen, ${currentUser.username}!`);
