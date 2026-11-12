@@ -74,6 +74,11 @@
         <span>📐 Suchbereich</span>
       </button>
 
+      <!-- Login Button (Visible when NOT logged in) -->
+      <button id="btn-login" onclick="openAuthModal()" class="px-3 py-1.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold shadow transition flex items-center space-x-1.5">
+        <span>🔑 Anmelden</span>
+      </button>
+
       <!-- User Badge & Logout -->
       <div id="user-badge" class="hidden items-center space-x-1.5 py-1 px-2.5 rounded-xl bg-slate-800/90 border border-slate-700/60 text-xs">
         <span id="user-role-label" class="px-1.5 py-0.5 rounded text-[9px] font-bold bg-amber-500/20 text-amber-400 border border-amber-500/30">Admin</span>
@@ -463,8 +468,11 @@
   </div>
 
   <!-- MODAL: AUTHENTICATION (LOGIN / REGISTRIERUNG) -->
-  <div id="modal-auth" class="fixed inset-0 z-[20000] bg-slate-950/85 backdrop-blur-md flex items-center justify-center p-4">
-    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-sm p-6 shadow-2xl space-y-4">
+  <div id="modal-auth" class="hidden fixed inset-0 z-[20000] bg-slate-950/85 backdrop-blur-md flex items-center justify-center p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-sm p-6 shadow-2xl space-y-4 relative">
+      <button onclick="hideAuthModal()" class="absolute top-3.5 right-3.5 text-slate-400 hover:text-slate-200 p-1 rounded-lg hover:bg-slate-800 transition" title="Schließen">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+      </button>
       <div class="text-center space-y-2">
         <div class="w-12 h-12 mx-auto rounded-xl bg-cyan-500/15 border border-cyan-500/30 flex items-center justify-center text-xl shadow">
           📡
@@ -859,23 +867,28 @@
 
     let hullsMap = {};
 
+    const defaultLengthByCategory = {
+      'Cargo': 140,
+      'Tanker': 180,
+      'Passenger': 130,
+      'High Speed Craft': 38,
+      'Tug': 30,
+      'Fishing': 24,
+      'Pleasure': 14,
+      'Sailing': 15,
+      'Military': 130,
+      'Other': 45
+    };
+
+    function getMetersPerPixel(lat, zoom) {
+      return (40075016.686 * Math.cos(lat * (Math.PI / 180))) / (256 * Math.pow(2, zoom));
+    }
+
     function getHullPolygonLatLngs(lat, lon, length, width, headingDeg, category) {
       const rad = ((headingDeg !== undefined && headingDeg !== null && !isNaN(headingDeg)) ? headingDeg : 0) * (Math.PI / 180);
       const sinH = Math.sin(rad);
       const cosH = Math.cos(rad);
 
-      const defaultLengthByCategory = {
-        'Cargo': 140,
-        'Tanker': 180,
-        'Passenger': 130,
-        'High Speed Craft': 38,
-        'Tug': 30,
-        'Fishing': 24,
-        'Pleasure': 14,
-        'Sailing': 15,
-        'Military': 130,
-        'Other': 45
-      };
       const defLen = defaultLengthByCategory[category] || 60;
       const len = Math.max(10, Math.min(450, parseFloat(length) || defLen));
       const wid = Math.max(3, Math.min(65, parseFloat(width) || Math.max(4, len * 0.16)));
@@ -1111,32 +1124,31 @@
 
       // Cap at 300 simultaneous active Leaflet markers to keep CPU at minimal level
       const renderList = visibleVessels.slice(0, 300);
-      const renderSet = new Set(renderList.map(v => v.mmsi));
-
-      const isZoomedIn = map.getZoom() >= 13;
-
-      // When zoomed in, remove static markers so they do NOT cover the dynamic hull
-      Object.keys(markersMap).forEach(mmsi => {
-        if (isZoomedIn || !renderSet.has(mmsi)) {
-          map.removeLayer(markersMap[mmsi]);
-          delete markersMap[mmsi];
-        }
-      });
-
-      // When zoomed out, remove true-scale hull polygons
-      Object.keys(hullsMap).forEach(mmsi => {
-        if (!isZoomedIn || !renderSet.has(mmsi)) {
-          map.removeLayer(hullsMap[mmsi]);
-          delete hullsMap[mmsi];
-        }
-      });
+      const zoom = map.getZoom();
+      const currentActivePolys = new Set();
+      const currentActiveMarkers = new Set();
 
       renderList.forEach(v => {
         const color = categoryColors[v.category] || '#94a3b8';
         const hdg = v.heading != null ? v.heading : (v.course || 0);
 
-        // Maßstabsgetreuer Schiffsrumpf (True-Scale Hull Polygon) bei hohem Zoom (>= 13)
-        if (isZoomedIn) {
+        // Dynamische Umschaltung basierend auf tatsächlicher Schiffslänge & Pixelgröße auf dem Bildschirm:
+        // Ein Schiff wird NUR DANN als maßstabsgetreuer Rumpf gezeichnet, wenn es bei aktuellem Zoom
+        // mindestens 26 Pixel lang auf dem Bildschirm wäre.
+        // Kleine Boote (z.B. 10-25m Segel-/Motorboote) bleiben so immer als gut sichtbare Marker erkennbar!
+        const defLen = defaultLengthByCategory[v.category] || 60;
+        const vLen = Math.max(10, Math.min(450, parseFloat(v.length) || defLen));
+        const mpp = getMetersPerPixel(v.latitude, zoom);
+        const pixelLength = vLen / mpp;
+        const showAsHullPolygon = pixelLength >= 26;
+
+        if (showAsHullPolygon) {
+          currentActivePolys.add(v.mmsi);
+          if (markersMap[v.mmsi]) {
+            map.removeLayer(markersMap[v.mmsi]);
+            delete markersMap[v.mmsi];
+          }
+
           const hullPts = getHullPolygonLatLngs(v.latitude, v.longitude, v.length, v.width, hdg, v.category);
           if (hullsMap[v.mmsi]) {
             hullsMap[v.mmsi].setLatLngs(hullPts);
@@ -1160,7 +1172,13 @@
             hullsMap[v.mmsi] = poly;
           }
         } else {
-          // Standard-Marker mit Schiffssilhouette / Pfeil bei Übersicht (Zoom < 13)
+          // Kleines Boot oder herausgezoomt: Klares, gut klickbares Navigations-Icon (mindestens 20-24px)
+          currentActiveMarkers.add(v.mmsi);
+          if (hullsMap[v.mmsi]) {
+            map.removeLayer(hullsMap[v.mmsi]);
+            delete hullsMap[v.mmsi];
+          }
+
           if (markersMap[v.mmsi]) {
             const m = markersMap[v.mmsi];
             const curPos = m.getLatLng();
@@ -1183,6 +1201,20 @@
             m.on('click', () => openTrack(v.mmsi));
             markersMap[v.mmsi] = m;
           }
+        }
+      });
+
+      // Cleanup: Entferne nicht mehr sichtbare Marker und Polygone
+      Object.keys(markersMap).forEach(mmsi => {
+        if (!currentActiveMarkers.has(mmsi)) {
+          map.removeLayer(markersMap[mmsi]);
+          delete markersMap[mmsi];
+        }
+      });
+      Object.keys(hullsMap).forEach(mmsi => {
+        if (!currentActivePolys.has(mmsi)) {
+          map.removeLayer(hullsMap[mmsi]);
+          delete hullsMap[mmsi];
         }
       });
 
@@ -1631,6 +1663,11 @@
     }
 
     async function openSettingsModal() {
+      if (!currentUser || currentUser.role !== 'admin') {
+        showToast('Bitte als Administrator anmelden, um Einstellungen zu öffnen.');
+        openAuthModal('login');
+        return;
+      }
       const res = await fetch('/api/stats');
       const data = await res.json();
       const cfg = data.config || {};
@@ -1732,18 +1769,31 @@
         hasRegisteredUsers = data.has_users;
         registrationEnabled = data.registration_enabled;
 
-        if (!data.authenticated) {
-          showAuthModal(!hasRegisteredUsers);
-          return false;
-        } else {
+        renderUserBadge();
+
+        if (data.authenticated) {
           hideAuthModal();
-          renderUserBadge();
           return true;
+        } else {
+          // Gast-Zugriff erlaubt: Karte ist frei bedienbar.
+          // Nur wenn noch nie ein Admin-Konto angelegt wurde, Ersteinrichtung zeigen:
+          if (!hasRegisteredUsers) {
+            showAuthModal(true);
+          } else {
+            hideAuthModal();
+          }
+          return false;
         }
       } catch (e) {
         console.error('Fehler bei Authentifizierungsprüfung:', e);
+        renderUserBadge();
         return false;
       }
+    }
+
+    function openAuthModal(initialTab = 'login') {
+      switchAuthTab(initialTab);
+      showAuthModal(!hasRegisteredUsers);
     }
 
     function showAuthModal(isFirstSetup = false) {
@@ -1875,15 +1925,13 @@
       } catch (e) {}
       currentUser = null;
       renderUserBadge();
-      liveVessels = [];
-      renderMapMarkers();
-      renderSidebarList();
-      showToast('Erfolgreich abgemeldet');
+      showToast('Abgemeldet (Gast-Modus)');
       checkAuth();
     }
 
     function renderUserBadge() {
       const badge = document.getElementById('user-badge');
+      const btnLogin = document.getElementById('btn-login');
       const roleLabel = document.getElementById('user-role-label');
       const nameLabel = document.getElementById('user-name-label') || document.getElementById('user-email-label');
       const btnSettings = document.getElementById('btn-settings');
@@ -1893,6 +1941,7 @@
           badge.classList.remove('hidden');
           badge.classList.add('flex');
         }
+        if (btnLogin) btnLogin.classList.add('hidden');
         if (roleLabel) {
           roleLabel.textContent = currentUser.role === 'admin' ? 'Admin' : 'User';
           roleLabel.className = currentUser.role === 'admin' 
@@ -1912,7 +1961,8 @@
           badge.classList.add('hidden');
           badge.classList.remove('flex');
         }
-        if (btnSettings) btnSettings.classList.add('hidden');
+        if (btnLogin) btnLogin.classList.remove('hidden');
+        if (btnSettings) btnSettings.classList.remove('hidden');
       }
     }
 
@@ -1995,16 +2045,14 @@
     map.on('moveend', renderSidebarAndMarkers);
 
     // Initial Start & Auto-Poll every 10 seconds (pauses when tab is inactive)
-    checkAuth().then(isAuthed => {
+    checkAuth().finally(() => {
       drawBBoxOverlay();
-      if (isAuthed) {
-        loadLiveVessels();
-        setInterval(() => {
-          if (!document.hidden) {
-            loadLiveVessels();
-          }
-        }, 10000);
-      }
+      loadLiveVessels();
+      setInterval(() => {
+        if (!document.hidden) {
+          loadLiveVessels();
+        }
+      }, 10000);
     });
   </script>
 </body>

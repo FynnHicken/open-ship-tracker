@@ -1218,16 +1218,7 @@ async def get_live_vessels(
     search: Optional[str] = None
 ):
     """Gibt alle Schiffe zurück, die innerhalb von max_age_minutes eine Position gemeldet haben.
-    Wenn explizit nach einem Schiff/MMSI/Rufzeichen gesucht wird (search), werden auch ältere/archivierte
-    letzte Positionen (> max_age_minutes, auch > 30 Tage) zurückgegeben und als is_historical markiert."""
-    user = get_current_user(request)
-    if not user:
-        with sqlite3.connect(DB_FILE) as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT COUNT(*) FROM users")
-            if cur.fetchone()[0] > 0:
-                raise HTTPException(status_code=401, detail="Authentifizierung erforderlich. Bitte einloggen.")
-
+    Öffentlich auch ohne Login zugänglich, damit die Live-Karte sofort einsehbar ist."""
     cutoff = (datetime.now(timezone.utc) - timedelta(minutes=max_age_minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
     has_explicit_search = bool(search and len(search.strip()) >= 2)
     try:
@@ -1305,14 +1296,6 @@ async def get_mmsi_database(
     offset: int = 0
 ):
     """Durchsucht die gesamte aufgebaute MMSI-Schiffsdatenbank (auch Schiffe, die gerade außer Reichweite sind)."""
-    user = get_current_user(request)
-    if not user:
-        with sqlite3.connect(DB_FILE) as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT COUNT(*) FROM users")
-            if cur.fetchone()[0] > 0:
-                raise HTTPException(status_code=401, detail="Authentifizierung erforderlich. Bitte einloggen.")
-
     try:
         with sqlite3.connect(DB_FILE) as conn:
             conn.row_factory = sqlite3.Row
@@ -1379,14 +1362,6 @@ async def get_vessel_history(
     limit: int = 5000
 ):
     """Gibt die gespeicherte 30-Tage-Route eines Schiffes zurück."""
-    user = get_current_user(request)
-    if not user:
-        with sqlite3.connect(DB_FILE) as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT COUNT(*) FROM users")
-            if cur.fetchone()[0] > 0:
-                raise HTTPException(status_code=401, detail="Authentifizierung erforderlich. Bitte einloggen.")
-
     try:
         with sqlite3.connect(DB_FILE) as conn:
             conn.row_factory = sqlite3.Row
