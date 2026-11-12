@@ -1662,24 +1662,18 @@
       const errBox = document.getElementById('auth-error');
       if (errBox) errBox.classList.add('hidden');
 
+      if (tabs) tabs.classList.remove('hidden');
+      const loginTab = document.getElementById('tab-login');
+      const regTab = document.getElementById('tab-register');
+      if (loginTab) loginTab.classList.remove('hidden');
+      if (regTab) regTab.classList.remove('hidden');
+
       if (isFirstSetup) {
         if (banner) banner.classList.remove('hidden');
-        if (tabs) tabs.classList.remove('hidden');
-        const loginTab = document.getElementById('tab-login');
-        if (loginTab) loginTab.classList.add('hidden');
         switchAuthTab('register');
       } else {
         if (banner) banner.classList.add('hidden');
-        if (tabs) {
-          tabs.classList.remove('hidden');
-          const loginTab = document.getElementById('tab-login');
-          const regTab = document.getElementById('tab-register');
-          if (loginTab) loginTab.classList.remove('hidden');
-          if (regTab) {
-            if (!registrationEnabled) regTab.classList.add('hidden');
-            else regTab.classList.remove('hidden');
-          }
-        }
+        if (regTab && !registrationEnabled) regTab.classList.add('hidden');
         switchAuthTab('login');
       }
       if (modal) modal.classList.remove('hidden');
@@ -1710,6 +1704,10 @@
         if (submitBtn) submitBtn.textContent = 'Anmelden';
         if (title) title.textContent = 'OpenShipTracker';
         if (subtitle) subtitle.textContent = 'Privates AIS Live Radar & Flottenmonitor';
+        if (!hasRegisteredUsers && errBox) {
+          errBox.textContent = 'Hinweis: Es existiert noch kein Konto. Bitte wechsle auf "Registrieren", um den Administrator einzurichten.';
+          errBox.classList.remove('hidden');
+        }
       } else {
         if (btnReg) btnReg.className = 'flex-1 py-1.5 rounded-md font-semibold text-white bg-blue-600 transition';
         if (btnLogin) btnLogin.className = 'flex-1 py-1.5 rounded-md font-medium text-slate-400 hover:text-slate-200 transition';
@@ -1744,7 +1742,7 @@
           }
           return;
         }
-        if (confirmInput && confirmInput.value && password !== confirmInput.value) {
+        if (confirmInput && password !== confirmInput.value) {
           if (errBox) {
             errBox.textContent = 'Die Passwörter stimmen nicht überein.';
             errBox.classList.remove('hidden');
