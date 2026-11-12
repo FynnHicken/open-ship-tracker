@@ -859,25 +859,41 @@
 
     let hullsMap = {};
 
-    function getHullPolygonLatLngs(lat, lon, length, width, headingDeg) {
+    function getHullPolygonLatLngs(lat, lon, length, width, headingDeg, category) {
       const rad = ((headingDeg !== undefined && headingDeg !== null && !isNaN(headingDeg)) ? headingDeg : 0) * (Math.PI / 180);
       const sinH = Math.sin(rad);
       const cosH = Math.cos(rad);
 
-      const len = Math.max(12, Math.min(450, parseFloat(length) || 85));
-      const wid = Math.max(3, Math.min(65, parseFloat(width) || (len * 0.16)));
+      const defaultLengthByCategory = {
+        'Cargo': 140,
+        'Tanker': 180,
+        'Passenger': 130,
+        'High Speed Craft': 38,
+        'Tug': 30,
+        'Fishing': 24,
+        'Pleasure': 14,
+        'Sailing': 15,
+        'Military': 130,
+        'Other': 45
+      };
+      const defLen = defaultLengthByCategory[category] || 60;
+      const len = Math.max(10, Math.min(450, parseFloat(length) || defLen));
+      const wid = Math.max(3, Math.min(65, parseFloat(width) || Math.max(4, len * 0.16)));
 
       const halfL = len / 2.0;
       const halfW = wid / 2.0;
-      const bowTrans = halfL * 0.45; // Übergang zur Bugspitze
 
-      // Lokale Punkte (Meter relativ zum Schiffszentrum: +y = Bug, +x = Steuerbord)
+      // 9-Punkt ECDIS-Schiffsrumpf (Meter relativ zum Zentrum: +y = Bug, +x = Steuerbord)
       const localPts = [
-        [0, halfL],          // 1. Bugspitze
-        [halfW, bowTrans],   // 2. Steuerbord-Bug
-        [halfW, -halfL],     // 3. Steuerbord-Heck
-        [-halfW, -halfL],    // 4. Backbord-Heck
-        [-halfW, bowTrans]   // 5. Backbord-Bug
+        [0, halfL],                   // 1. Bugspitze
+        [halfW * 0.70, halfL * 0.75], // 2. Steuerbord-Bug
+        [halfW, halfL * 0.35],        // 3. Steuerbord-Schulter
+        [halfW, -halfL * 0.75],       // 4. Steuerbord-Mittschiffs
+        [halfW * 0.85, -halfL],       // 5. Steuerbord-Heck
+        [-halfW * 0.85, -halfL],      // 6. Backbord-Heck
+        [-halfW, -halfL * 0.75],      // 7. Backbord-Mittschiffs
+        [-halfW, halfL * 0.35],       // 8. Backbord-Schulter
+        [-halfW * 0.70, halfL * 0.75] // 9. Backbord-Bug
       ];
 
       const mPerDegLat = 111132.0;
@@ -1097,17 +1113,17 @@
       const renderList = visibleVessels.slice(0, 300);
       const renderSet = new Set(renderList.map(v => v.mmsi));
 
-      const isZoomedIn = map.getZoom() >= 14;
+      const isZoomedIn = map.getZoom() >= 13;
 
-      // Remove old markers not in visible set
+      // When zoomed in, remove static markers so they do NOT cover the dynamic hull
       Object.keys(markersMap).forEach(mmsi => {
-        if (!renderSet.has(mmsi)) {
+        if (isZoomedIn || !renderSet.has(mmsi)) {
           map.removeLayer(markersMap[mmsi]);
           delete markersMap[mmsi];
         }
       });
 
-      // Remove old hull polygons not in visible set or when zoomed out
+      // When zoomed out, remove true-scale hull polygons
       Object.keys(hullsMap).forEach(mmsi => {
         if (!isZoomedIn || !renderSet.has(mmsi)) {
           map.removeLayer(hullsMap[mmsi]);
@@ -1119,9 +1135,9 @@
         const color = categoryColors[v.category] || '#94a3b8';
         const hdg = v.heading != null ? v.heading : (v.course || 0);
 
-        // Maßstabsgetreuer Schiffsrumpf (True-Scale Hull Polygon) bei hohem Zoom
+        // Maßstabsgetreuer Schiffsrumpf (True-Scale Hull Polygon) bei hohem Zoom (>= 13)
         if (isZoomedIn) {
-          const hullPts = getHullPolygonLatLngs(v.latitude, v.longitude, v.length, v.width, hdg);
+          const hullPts = getHullPolygonLatLngs(v.latitude, v.longitude, v.length, v.width, hdg, v.category);
           if (hullsMap[v.mmsi]) {
             hullsMap[v.mmsi].setLatLngs(hullPts);
             hullsMap[v.mmsi].setStyle({ color: '#020617', fillColor: color });
@@ -1130,36 +1146,43 @@
               color: '#020617',
               weight: 1.5,
               fillColor: color,
-              fillOpacity: 0.85,
+              fillOpacity: 0.88,
               interactive: true
             }).addTo(map);
             poly.bindPopup(() => getVesselPopupHtml(v));
             poly.on('click', () => openTrack(v.mmsi));
+
+            const dims = (v.length && v.width) ? ` (${Math.round(v.length)}×${Math.round(v.width)}m)` : '';
+            poly.bindTooltip(`${v.name || 'MMSI ' + v.mmsi}${dims}`, {
+              sticky: true,
+              direction: 'top'
+            });
             hullsMap[v.mmsi] = poly;
           }
-        }
-
-        if (markersMap[v.mmsi]) {
-          const m = markersMap[v.mmsi];
-          const curPos = m.getLatLng();
-          if (Math.abs(curPos.lat - v.latitude) > 0.00005 || Math.abs(curPos.lng - v.longitude) > 0.00005) {
-            m.setLatLng([v.latitude, v.longitude]);
-          }
-          if (m._lastHdg !== hdg || m._lastSpeed !== v.speed || m._lastColor !== color) {
-            m.setIcon(createShipIcon(hdg, color, v.speed));
+        } else {
+          // Standard-Marker mit Schiffssilhouette / Pfeil bei Übersicht (Zoom < 13)
+          if (markersMap[v.mmsi]) {
+            const m = markersMap[v.mmsi];
+            const curPos = m.getLatLng();
+            if (Math.abs(curPos.lat - v.latitude) > 0.00005 || Math.abs(curPos.lng - v.longitude) > 0.00005) {
+              m.setLatLng([v.latitude, v.longitude]);
+            }
+            if (m._lastHdg !== hdg || m._lastSpeed !== v.speed || m._lastColor !== color) {
+              m.setIcon(createShipIcon(hdg, color, v.speed));
+              m._lastHdg = hdg;
+              m._lastSpeed = v.speed;
+              m._lastColor = color;
+            }
+          } else {
+            const icon = createShipIcon(hdg, color, v.speed);
+            const m = L.marker([v.latitude, v.longitude], { icon }).addTo(map);
             m._lastHdg = hdg;
             m._lastSpeed = v.speed;
             m._lastColor = color;
+            m.bindPopup(() => getVesselPopupHtml(v));
+            m.on('click', () => openTrack(v.mmsi));
+            markersMap[v.mmsi] = m;
           }
-        } else {
-          const icon = createShipIcon(hdg, color, v.speed);
-          const m = L.marker([v.latitude, v.longitude], { icon }).addTo(map);
-          m._lastHdg = hdg;
-          m._lastSpeed = v.speed;
-          m._lastColor = color;
-          m.bindPopup(() => getVesselPopupHtml(v));
-          m.on('click', () => openTrack(v.mmsi));
-          markersMap[v.mmsi] = m;
         }
       });
 
@@ -1208,12 +1231,13 @@
           v = liveVessels.find(x => x.mmsi === mmsi) || dbV;
         }
       }
-      const m = markersMap[mmsi];
+      const m = markersMap[mmsi] || hullsMap[mmsi];
       if (m) {
-        map.setView(m.getLatLng(), 12, { animate: true });
+        const targetLatLng = m.getLatLng ? m.getLatLng() : m.getBounds().getCenter();
+        map.setView(targetLatLng, Math.max(map.getZoom(), 14), { animate: true });
         m.openPopup();
       } else if (v && v.latitude && v.longitude) {
-        map.setView([v.latitude, v.longitude], 12, { animate: true });
+        map.setView([v.latitude, v.longitude], 14, { animate: true });
       }
       if (window.innerWidth < 768) {
         const mapEl = document.getElementById('map');
@@ -1967,6 +1991,7 @@
     }
 
     // Efficient Viewport Rendering on pan/zoom
+    map.on('zoomend', renderSidebarAndMarkers);
     map.on('moveend', renderSidebarAndMarkers);
 
     // Initial Start & Auto-Poll every 10 seconds (pauses when tab is inactive)
