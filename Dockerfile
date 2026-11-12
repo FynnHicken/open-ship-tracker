@@ -9,6 +9,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app/ ./app/
+COPY data/bight.db ./seed_bight.db
 
 EXPOSE 8050
 

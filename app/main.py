@@ -6,30 +6,51 @@ import sqlite3
 import logging
 import math
 import time
+import shutil
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import httpx
 import websockets
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-logger = logging.getLogger("bight-tracker")
+logger = logging.getLogger("open-ship-tracker")
 
 AISSTREAM_KEY = os.environ.get("AISSTREAM_API_KEY", "")
 CARTO_KEY = os.environ.get("CARTO_API_KEY", "")
+SYNC_TOKEN = os.environ.get("SYNC_TOKEN", "ost_sync_99e8a71b26f50c3d")
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 DB_FILE = os.path.join(DATA_DIR, "bight.db")
+
+# Cloud Sync Settings (for pushing from collector to central server)
+CLOUD_SYNC_ENABLED = os.environ.get("CLOUD_SYNC_ENABLED", "false").lower() in ("true", "1", "yes")
+CLOUD_SYNC_URL = os.environ.get("CLOUD_SYNC_URL", "https://open-ship-tracker.fly.dev/api/sync/batch")
+CLOUD_SYNC_TOKEN = os.environ.get("CLOUD_SYNC_TOKEN", SYNC_TOKEN)
+CLOUD_SYNC_INTERVAL = int(os.environ.get("CLOUD_SYNC_INTERVAL", "30"))
+
+sync_queue_positions: List[Dict[str, Any]] = []
+sync_queue_statics: List[Dict[str, Any]] = []
 
 # Bounding Box: Deutsche Bucht + Elbe/Weser/NOK + westliche Ostsee (Kiel bis Rügen)
 # Format für AISStream: [[[lat_min, lon_min], [lat_max, lon_max]]]
 DEFAULT_BBOX = [[[53.10, 5.80], [55.35, 14.30]]]
 
 app = FastAPI(
-    title="Deutsche Bucht & Ostsee – AIS Live Radar & MMSI Datenbank",
+    title="OpenShipTracker – AIS Live Radar, Fleet Filter & MMSI Database",
     version="1.0.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 NAV_STATUS_MAP = {
@@ -282,6 +303,23 @@ def save_config(cfg: Dict[str, Any]):
 
 def init_db():
     os.makedirs(DATA_DIR, exist_ok=True)
+    
+    # Check for seed database if volume is fresh
+    if not os.path.exists(DB_FILE):
+        seed_candidates = [
+            os.path.join(os.path.dirname(os.path.dirname(__file__)), "seed_bight.db"),
+            os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "bight.db"),
+            "/app/seed_bight.db"
+        ]
+        for sc in seed_candidates:
+            if os.path.exists(sc) and os.path.getsize(sc) > 1000:
+                try:
+                    shutil.copy2(sc, DB_FILE)
+                    logger.info(f"Initialized database from seed file: {sc}")
+                    break
+                except Exception as seed_err:
+                    logger.error(f"Error copying seed DB from {sc}: {seed_err}")
+
     with sqlite3.connect(DB_FILE) as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
@@ -676,6 +714,12 @@ def flush_batches(positions: List[Dict[str, Any]], statics: List[Dict[str, Any]]
 
             conn.commit()
             stream_state["positions_archived"] += archived_now
+
+            if CLOUD_SYNC_ENABLED:
+                if len(sync_queue_positions) < 5000:
+                    sync_queue_positions.extend(positions)
+                if len(sync_queue_statics) < 1000:
+                    sync_queue_statics.extend(statics)
     except Exception as e:
         logger.error(f"Error flushing batches to SQLite: {e}")
 
@@ -703,7 +747,101 @@ async def retention_cleanup_worker():
             logger.error(f"Retention cleanup error: {e}")
         await asyncio.sleep(3600)  # Einmal pro Stunde prüfen
 
+async def cloud_sync_worker():
+    """Pusht periodisch (z. B. alle 30s) neue Deltas an den zentralen Cloud-Server (Fly.io)."""
+    while True:
+        await asyncio.sleep(CLOUD_SYNC_INTERVAL)
+        if not CLOUD_SYNC_ENABLED or not CLOUD_SYNC_URL:
+            continue
+        if not sync_queue_positions and not sync_queue_statics:
+            continue
+
+        pos_batch = sync_queue_positions[:500]
+        stat_batch = sync_queue_statics[:200]
+
+        payload = {
+            "token": CLOUD_SYNC_TOKEN,
+            "positions": pos_batch,
+            "statics": stat_batch
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                res = await client.post(CLOUD_SYNC_URL, json=payload)
+                if res.status_code == 200:
+                    del sync_queue_positions[:len(pos_batch)]
+                    del sync_queue_statics[:len(stat_batch)]
+                    logger.info(f"Cloud-Sync OK: {len(pos_batch)} Pos, {len(stat_batch)} Stat an {CLOUD_SYNC_URL} übertragen")
+                else:
+                    logger.warning(f"Cloud-Sync HTTP {res.status_code}: {res.text[:120]}")
+        except Exception as e:
+            logger.warning(f"Cloud-Sync Verbindungsfehler ({e})")
+
 # --- API ENDPOINTS ---
+
+class BatchSyncRequest(BaseModel):
+    token: str
+    positions: List[Dict[str, Any]] = []
+    statics: List[Dict[str, Any]] = []
+
+class MmsiLookupRequest(BaseModel):
+    mmsis: List[str]
+
+@app.post("/api/sync/batch")
+async def receive_batch_sync(req: BatchSyncRequest):
+    expected_token = os.environ.get("SYNC_TOKEN", SYNC_TOKEN)
+    if req.token != expected_token:
+        raise HTTPException(status_code=401, detail="Ungültiger Sync-Token")
+
+    flush_batches(req.positions, req.statics)
+    return {
+        "status": "ok",
+        "received_positions": len(req.positions),
+        "received_statics": len(req.statics),
+        "total_archived": stream_state["positions_archived"]
+    }
+
+@app.post("/api/vessels/lookup")
+async def lookup_vessels(req: MmsiLookupRequest):
+    if not req.mmsis:
+        return {"vessels": [], "count": 0}
+    clean_mmsis = [str(m).strip() for m in req.mmsis if str(m).strip()][:500]
+    placeholders = ",".join("?" for _ in clean_mmsis)
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute(f"SELECT * FROM vessels WHERE mmsi IN ({placeholders})", clean_mmsis)
+            rows = [dict(r) for r in cur.fetchall()]
+            return {"vessels": rows, "count": len(rows)}
+    except Exception as e:
+        logger.error(f"Lookup error: {e}")
+        return {"vessels": [], "count": 0, "error": str(e)}
+
+@app.get("/api/export/mmsi.json")
+async def export_mmsi_json():
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM vessels ORDER BY mmsi ASC")
+            rows = [dict(r) for r in cur.fetchall()]
+            return JSONResponse(
+                content=rows,
+                headers={"Content-Disposition": f"attachment; filename=mmsi_database_{datetime.now(timezone.utc).strftime('%Y%m%d')}.json"}
+            )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/export/bight.db")
+async def export_db_file():
+    if os.path.exists(DB_FILE):
+        return FileResponse(
+            DB_FILE,
+            media_type="application/x-sqlite3",
+            filename=f"bight_{datetime.now(timezone.utc).strftime('%Y%m%d')}.db"
+        )
+    raise HTTPException(status_code=404, detail="Datenbank nicht gefunden")
 
 def get_fleet_memberships(cur) -> tuple[List[Dict[str, Any]], Dict[str, List[str]], Dict[str, str]]:
     cur.execute("SELECT id, name, icon, color, is_system FROM fleets ORDER BY is_system DESC, name ASC")
@@ -1072,6 +1210,8 @@ async def startup_event():
     init_db()
     asyncio.create_task(aisstream_worker())
     asyncio.create_task(retention_cleanup_worker())
+    if CLOUD_SYNC_ENABLED:
+        asyncio.create_task(cloud_sync_worker())
 
 static_dir = os.path.join(os.path.dirname(__file__), "static")
 os.makedirs(static_dir, exist_ok=True)
