@@ -123,8 +123,8 @@ DEFAULT_NAVY_VESSELS = [
     {"mmsi": "211210180", "name": "Bayern", "pennant": "F 217", "category": "Fregatte", "class_name": "Klasse 123 (Brandenburg)", "homeport": "Wilhelmshaven"},
     {"mmsi": "211210190", "name": "Mecklenburg-Vorpommern", "pennant": "F 218", "category": "Fregatte", "class_name": "Klasse 123 (Brandenburg)", "homeport": "Wilhelmshaven"},
     {"mmsi": "211210150", "name": "Sachsen", "pennant": "F 219", "category": "Fregatte", "class_name": "Klasse 124 (Sachsen)", "homeport": "Wilhelmshaven"},
-    {"mmsi": "211210280", "name": "Hamburg", "pennant": "F 220", "category": "Fregatte", "class_name": "Klasse 124 (Sachsen)", "homeport": "Wilhelmshaven"},
-    {"mmsi": "211210200", "name": "Hamburg (Alt-MMSI)", "pennant": "F 220", "category": "Fregatte", "class_name": "Klasse 124 (Sachsen)", "homeport": "Wilhelmshaven"},
+    {"mmsi": "211905000", "name": "Hamburg", "pennant": "F 220", "category": "Fregatte", "class_name": "Klasse 124 (Sachsen)", "homeport": "Wilhelmshaven"},
+    {"mmsi": "211210200", "name": "Augsburg (a.D.)", "pennant": "F 213", "category": "Fregatte", "class_name": "Klasse 122 (Bremen)", "homeport": "Wilhelmshaven"},
     {"mmsi": "211906000", "name": "Hessen", "pennant": "F 221", "category": "Fregatte", "class_name": "Klasse 124 (Sachsen)", "homeport": "Wilhelmshaven"},
     {"mmsi": "211920000", "name": "Baden-Württemberg", "pennant": "F 222", "category": "Fregatte", "class_name": "Klasse 125 (Baden-Württemberg)", "homeport": "Wilhelmshaven"},
     {"mmsi": "211921000", "name": "Nordrhein-Westfalen", "pennant": "F 223", "category": "Fregatte", "class_name": "Klasse 125 (Baden-Württemberg)", "homeport": "Wilhelmshaven"},
@@ -186,7 +186,8 @@ DEFAULT_NAVY_VESSELS = [
     {"mmsi": "211211600", "name": "Planet", "pennant": "A 1458", "category": "Forschungsschiff", "class_name": "Klasse 751 (Planet)", "homeport": "Eckernförde"},
     {"mmsi": "211915000", "name": "Rügen", "pennant": "A 1459", "category": "Schlepper", "class_name": "Bergungsschlepper", "homeport": "Kiel"},
     {"mmsi": "211916000", "name": "Borkum", "pennant": "Y 890", "category": "Schlepper", "class_name": "Hafenschlepper", "homeport": "Kiel"},
-    {"mmsi": "211211230", "name": "Gorch Fock", "pennant": "A 60", "category": "Schulschiff", "class_name": "Gorch-Fock-Klasse", "homeport": "Kiel"},
+    {"mmsi": "211210280", "name": "Gorch Fock", "pennant": "A 60", "category": "Schulschiff", "class_name": "Gorch-Fock-Klasse", "homeport": "Kiel"},
+    {"mmsi": "211930000", "name": "U 35", "pennant": "S 185", "category": "U-Boot", "class_name": "Klasse 212A", "homeport": "Eckernförde"},
     {"mmsi": "211212720", "name": "Munster", "pennant": "A 1433", "category": "Unterstützungseinheit", "class_name": "Klasse 740 (Mehrzweckboot)", "homeport": "Eckernförde"},
     {"mmsi": "211212700", "name": "Baumholder", "pennant": "A 1434", "category": "Unterstützungseinheit", "class_name": "Klasse 740 (Mehrzweckboot)", "homeport": "Eckernförde"}
 ]
