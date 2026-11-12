@@ -8,8 +8,10 @@ import math
 import time
 import shutil
 from datetime import datetime, timezone, timedelta
-from typing import Optional, List, Dict, Any
-from fastapi import FastAPI, HTTPException, Query
+import hashlib
+import secrets
+from typing import Optional, List, Dict, Any, Tuple
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -210,6 +212,19 @@ class SettingsUpdate(BaseModel):
     lat_max: Optional[float] = None
     lon_max: Optional[float] = None
     bbox: Optional[List[List[List[float]]]] = None
+    allow_registration: Optional[bool] = None
+
+class RegisterRequest(BaseModel):
+    email: str
+    password: str
+    username: Optional[str] = None
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+class UpdateRoleRequest(BaseModel):
+    role: str
 
 def get_country_from_mmsi(mmsi: str) -> str:
     if len(mmsi) == 9:
@@ -280,7 +295,8 @@ def load_config() -> Dict[str, Any]:
         "retention_days": 30,
         "aisstream_key": AISSTREAM_KEY,
         "carto_key": CARTO_KEY,
-        "bbox": DEFAULT_BBOX
+        "bbox": DEFAULT_BBOX,
+        "allow_registration": True
     }
     os.makedirs(DATA_DIR, exist_ok=True)
     if not os.path.exists(CONFIG_FILE):
@@ -300,6 +316,79 @@ def save_config(cfg: Dict[str, Any]):
     os.makedirs(DATA_DIR, exist_ok=True)
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
+
+SESSION_COOKIE_NAME = "ost_session_token"
+SESSION_DURATION_DAYS = 30
+
+def hash_password(password: str) -> Tuple[str, str]:
+    salt = secrets.token_hex(16)
+    pw_hash = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 200_000).hex()
+    return pw_hash, salt
+
+def verify_password(password: str, pw_hash: str, salt: str) -> bool:
+    check = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 200_000).hex()
+    return secrets.compare_digest(check, pw_hash)
+
+def create_session(user_id: int) -> str:
+    token = secrets.token_urlsafe(32)
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(days=SESSION_DURATION_DAYS)
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute(
+            "INSERT INTO user_sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+            (token, user_id, now.isoformat(), expires.isoformat())
+        )
+    return token
+
+def get_user_from_session(token: str) -> Optional[Dict[str, Any]]:
+    if not token:
+        return None
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT u.id, u.email, u.username, u.role, u.is_active, s.expires_at
+                FROM user_sessions s
+                JOIN users u ON s.user_id = u.id
+                WHERE s.token = ? AND s.expires_at > ? AND u.is_active = 1
+            """, (token, now_iso))
+            row = cur.fetchone()
+            if row:
+                return dict(row)
+    except Exception as e:
+        logger.error(f"Error querying session: {e}")
+    return None
+
+def delete_session(token: str):
+    if not token:
+        return
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.execute("DELETE FROM user_sessions WHERE token = ?", (token,))
+    except Exception as e:
+        logger.error(f"Error deleting session: {e}")
+
+def get_current_user(request: Request) -> Optional[Dict[str, Any]]:
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    if not token:
+        auth_header = request.headers.get("Authorization")
+        if auth_header and auth_header.startswith("Bearer "):
+            token = auth_header[7:].strip()
+    return get_user_from_session(token)
+
+def require_auth(request: Request) -> Dict[str, Any]:
+    user = get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentifizierung erforderlich. Bitte einloggen.")
+    return user
+
+def require_admin(request: Request) -> Dict[str, Any]:
+    user = require_auth(request)
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Administratorrechte erforderlich.")
+    return user
 
 def init_db():
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -383,6 +472,31 @@ def init_db():
                 custom_name TEXT,
                 notes TEXT,
                 PRIMARY KEY (fleet_id, mmsi)
+            )
+        """)
+
+        # Benutzer & Session-Verwaltung
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT UNIQUE NOT NULL,
+                username TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                salt TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'user',
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                last_login TEXT
+            )
+        """)
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_sessions (
+                token TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
             )
         """)
 
@@ -777,6 +891,157 @@ async def cloud_sync_worker():
         except Exception as e:
             logger.warning(f"Cloud-Sync Verbindungsfehler ({e})")
 
+# --- AUTHENTICATION & USER MANAGEMENT ENDPOINTS ---
+
+@app.get("/api/auth/me")
+async def auth_me(request: Request):
+    user = get_current_user(request)
+    with sqlite3.connect(DB_FILE) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM users")
+        user_count = cur.fetchone()[0]
+    cfg = load_config()
+    reg_enabled = cfg.get("allow_registration", True)
+    return {
+        "authenticated": user is not None,
+        "user": {
+            "id": user["id"],
+            "email": user["email"],
+            "username": user["username"],
+            "role": user["role"]
+        } if user else None,
+        "has_users": user_count > 0,
+        "registration_enabled": bool(reg_enabled or user_count == 0)
+    }
+
+@app.post("/api/auth/register")
+async def auth_register(req: RegisterRequest, response: Response):
+    email = req.email.strip().lower()
+    password = req.password
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Bitte eine gültige E-Mail-Adresse angeben.")
+    if len(password) < 6:
+        raise HTTPException(status_code=400, detail="Das Passwort muss mindestens 6 Zeichen lang sein.")
+
+    cfg = load_config()
+    allow_reg = cfg.get("allow_registration", True)
+
+    with sqlite3.connect(DB_FILE) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM users")
+        user_count = cur.fetchone()[0]
+
+        if user_count > 0 and not allow_reg:
+            raise HTTPException(status_code=403, detail="Die Registrierung für neue Konten ist derzeit deaktiviert.")
+
+        cur.execute("SELECT id FROM users WHERE email = ?", (email,))
+        if cur.fetchone():
+            raise HTTPException(status_code=400, detail="Diese E-Mail-Adresse ist bereits registriert.")
+
+        # Der erste Account wird automatisch Admin!
+        role = "admin" if user_count == 0 else "user"
+        username = (req.username or email.split("@")[0]).strip()
+        pw_hash, salt = hash_password(password)
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        cur.execute("""
+            INSERT INTO users (email, username, password_hash, salt, role, created_at, last_login)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (email, username, pw_hash, salt, role, now_iso, now_iso))
+        user_id = cur.lastrowid
+
+    token = create_session(user_id)
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=token,
+        max_age=SESSION_DURATION_DAYS * 86400,
+        httponly=True,
+        samesite="lax",
+        secure=False
+    )
+    return {
+        "status": "ok",
+        "user": {
+            "id": user_id,
+            "email": email,
+            "username": username,
+            "role": role
+        }
+    }
+
+@app.post("/api/auth/login")
+async def auth_login(req: LoginRequest, response: Response):
+    email = req.email.strip().lower()
+    password = req.password
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM users WHERE email = ? AND is_active = 1", (email,))
+        user = cur.fetchone()
+        if not user or not verify_password(password, user["password_hash"], user["salt"]):
+            raise HTTPException(status_code=401, detail="Ungültige E-Mail-Adresse oder falsches Passwort.")
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        conn.execute("UPDATE users SET last_login = ? WHERE id = ?", (now_iso, user["id"]))
+
+    token = create_session(user["id"])
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=token,
+        max_age=SESSION_DURATION_DAYS * 86400,
+        httponly=True,
+        samesite="lax",
+        secure=False
+    )
+    return {
+        "status": "ok",
+        "user": {
+            "id": user["id"],
+            "email": user["email"],
+            "username": user["username"],
+            "role": user["role"]
+        }
+    }
+
+@app.post("/api/auth/logout")
+async def auth_logout(request: Request, response: Response):
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    if token:
+        delete_session(token)
+    response.delete_cookie(SESSION_COOKIE_NAME)
+    return {"status": "ok"}
+
+@app.get("/api/auth/users")
+async def get_users_list(request: Request):
+    require_admin(request)
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute("SELECT id, email, username, role, is_active, created_at, last_login FROM users ORDER BY id ASC")
+        return {"users": [dict(r) for r in cur.fetchall()]}
+
+@app.post("/api/auth/users/{user_id}/role")
+async def update_user_role(user_id: int, req: UpdateRoleRequest, request: Request):
+    admin = require_admin(request)
+    new_role = req.role.strip().lower()
+    if new_role not in ["admin", "user"]:
+        raise HTTPException(status_code=400, detail="Ungültige Rolle. Nur 'admin' oder 'user' erlaubt.")
+    if admin["id"] == user_id and new_role != "admin":
+        raise HTTPException(status_code=400, detail="Sie können sich Ihre eigenen Administratorrechte nicht entziehen.")
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute("UPDATE users SET role = ? WHERE id = ?", (new_role, user_id))
+    return {"status": "ok", "user_id": user_id, "role": new_role}
+
+@app.delete("/api/auth/users/{user_id}")
+async def delete_user_account(user_id: int, request: Request):
+    admin = require_admin(request)
+    if admin["id"] == user_id:
+        raise HTTPException(status_code=400, detail="Sie können Ihr eigenes Konto nicht löschen.")
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute("DELETE FROM user_sessions WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    return {"status": "ok", "deleted_user_id": user_id}
+
 # --- API ENDPOINTS ---
 
 class BatchSyncRequest(BaseModel):
@@ -946,6 +1211,7 @@ async def remove_vessel_from_fleet(fleet_id: str, mmsi: str):
 
 @app.get("/api/vessels")
 async def get_live_vessels(
+    request: Request,
     max_age_minutes: int = Query(120, description="Maximales Alter für Live-Karte in Minuten (Standard 120 Min, bis 43200 = 30 Tage)"),
     category: Optional[str] = None,
     fleet_id: Optional[str] = None,
@@ -954,6 +1220,14 @@ async def get_live_vessels(
     """Gibt alle Schiffe zurück, die innerhalb von max_age_minutes eine Position gemeldet haben.
     Wenn explizit nach einem Schiff/MMSI/Rufzeichen gesucht wird (search), werden auch ältere/archivierte
     letzte Positionen (> max_age_minutes, auch > 30 Tage) zurückgegeben und als is_historical markiert."""
+    user = get_current_user(request)
+    if not user:
+        with sqlite3.connect(DB_FILE) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM users")
+            if cur.fetchone()[0] > 0:
+                raise HTTPException(status_code=401, detail="Authentifizierung erforderlich. Bitte einloggen.")
+
     cutoff = (datetime.now(timezone.utc) - timedelta(minutes=max_age_minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
     has_explicit_search = bool(search and len(search.strip()) >= 2)
     try:
@@ -1022,6 +1296,7 @@ async def get_live_vessels(
 
 @app.get("/api/mmsi-database")
 async def get_mmsi_database(
+    request: Request,
     search: Optional[str] = None,
     category: Optional[str] = None,
     fleet_id: Optional[str] = None,
@@ -1030,6 +1305,14 @@ async def get_mmsi_database(
     offset: int = 0
 ):
     """Durchsucht die gesamte aufgebaute MMSI-Schiffsdatenbank (auch Schiffe, die gerade außer Reichweite sind)."""
+    user = get_current_user(request)
+    if not user:
+        with sqlite3.connect(DB_FILE) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM users")
+            if cur.fetchone()[0] > 0:
+                raise HTTPException(status_code=401, detail="Authentifizierung erforderlich. Bitte einloggen.")
+
     try:
         with sqlite3.connect(DB_FILE) as conn:
             conn.row_factory = sqlite3.Row
@@ -1089,12 +1372,21 @@ async def get_mmsi_database(
 @app.get("/api/history/{mmsi}")
 async def get_vessel_history(
     mmsi: str,
+    request: Request,
     hours: Optional[int] = None,
     start: Optional[str] = None,
     end: Optional[str] = None,
     limit: int = 5000
 ):
     """Gibt die gespeicherte 30-Tage-Route eines Schiffes zurück."""
+    user = get_current_user(request)
+    if not user:
+        with sqlite3.connect(DB_FILE) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM users")
+            if cur.fetchone()[0] > 0:
+                raise HTTPException(status_code=401, detail="Authentifizierung erforderlich. Bitte einloggen.")
+
     try:
         with sqlite3.connect(DB_FILE) as conn:
             conn.row_factory = sqlite3.Row
@@ -1165,16 +1457,20 @@ async def get_stats():
                     "bbox": cfg.get("bbox", DEFAULT_BBOX),
                     "aisstream_key": cfg.get("aisstream_key", AISSTREAM_KEY),
                     "datadocked_key": cfg.get("datadocked_key", ""),
-                    "carto_key": cfg.get("carto_key", CARTO_KEY)
+                    "carto_key": cfg.get("carto_key", CARTO_KEY),
+                    "allow_registration": cfg.get("allow_registration", True)
                 }
             }
     except Exception as e:
         return {"error": str(e)}
 
 @app.post("/api/settings")
-async def update_settings(req: SettingsUpdate):
+async def update_settings(req: SettingsUpdate, request: Request):
+    require_admin(request)
     cfg = load_config()
     cfg["retention_days"] = max(1, min(90, req.retention_days))
+    if req.allow_registration is not None:
+        cfg["allow_registration"] = bool(req.allow_registration)
     if req.aisstream_key is not None and req.aisstream_key.strip():
         if req.aisstream_key.strip() != cfg.get("aisstream_key"):
             cfg["aisstream_key"] = req.aisstream_key.strip()
