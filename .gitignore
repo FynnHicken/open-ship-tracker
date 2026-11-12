@@ -4,10 +4,8 @@ __pycache__/
 *$py.class
 
 # Databases & local state
-*.db
 *.db-wal
 *.db-shm
-data/*.db
 data/*.db-wal
 data/*.db-shm
 data/config.json

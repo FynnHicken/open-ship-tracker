@@ -4,136 +4,313 @@ import asyncio
 import re
 import sqlite3
 import logging
-from datetime import datetime, timezone
+import math
+import time
+from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
-import httpx
 import websockets
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-logger = logging.getLogger("open-ship-tracker")
+logger = logging.getLogger("bight-tracker")
 
-API_KEY = os.environ.get("DATADOCKED_API_KEY", "")
 AISSTREAM_KEY = os.environ.get("AISSTREAM_API_KEY", "")
+CARTO_KEY = os.environ.get("CARTO_API_KEY", "")
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
-VESSELS_FILE = os.path.join(DATA_DIR, "vessels.json")
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
-DB_FILE = os.path.join(DATA_DIR, "archive.db")
-SEED_FILE = os.path.join(os.path.dirname(__file__), "vessels_seed.json")
+DB_FILE = os.path.join(DATA_DIR, "bight.db")
+
+# Bounding Box: Deutsche Bucht + Elbe/Weser/NOK + westliche Ostsee (Kiel bis Rügen)
+# Format für AISStream: [[[lat_min, lon_min], [lat_max, lon_max]]]
+DEFAULT_BBOX = [[[53.10, 5.80], [55.35, 14.30]]]
 
 app = FastAPI(
-    title="OpenShipTracker",
-    description="Open Source AIS Vessel Tracker & Voyage History with Live WebSockets and Route Filtering",
+    title="Deutsche Bucht & Ostsee – AIS Live Radar & MMSI Datenbank",
     version="1.0.0"
 )
 
 NAV_STATUS_MAP = {
-    0: "Under way using engine",
-    1: "At anchor",
-    2: "Not under command",
-    3: "Restricted manoeuvrability",
-    4: "Constrained by her draught",
-    5: "Moored",
-    6: "Aground",
-    7: "Engaged in fishing",
-    8: "Under way sailing",
-    15: "Active (AIS)"
+    0: "Unter Maschine",
+    1: "Vor Anker",
+    2: "Manövrierunfähig",
+    3: "Manövrierbehindert",
+    4: "Tiefgangsbehindert",
+    5: "Festgemacht",
+    6: "Auf Grund",
+    7: "Fischerei",
+    8: "Unter Segel",
+    14: "AIS-SART / Notfall",
+    15: "Aktiv (AIS)"
 }
 
-refresh_state = {
-    "is_refreshing": False,
-    "current": 0,
-    "total": 0,
-    "last_run": None,
-    "errors": [],
-    "aisstream_connected": False,
-    "aisstream_messages": 0
+MID_COUNTRY_MAP = {
+    "211": "DE", "218": "DE",
+    "219": "DK", "220": "DK",
+    "244": "NL", "245": "NL", "246": "NL",
+    "205": "BE",
+    "232": "GB", "233": "GB", "234": "GB", "235": "GB",
+    "257": "NO", "258": "NO", "259": "NO",
+    "265": "SE", "266": "SE",
+    "230": "FI",
+    "261": "PL",
+    "226": "FR", "227": "FR", "228": "FR",
+    "247": "IT",
+    "224": "ES", "225": "ES",
+    "255": "PT",
+    "209": "CY", "210": "CY", "212": "CY",
+    "215": "MT", "229": "MT", "248": "MT", "249": "MT", "256": "MT",
+    "237": "GR", "239": "GR", "240": "GR", "241": "GR",
+    "273": "RU",
+    "275": "LV",
+    "276": "EE",
+    "277": "LT",
+    "304": "AG", "305": "AG",
+    "308": "BS", "309": "BS", "311": "BS",
+    "314": "BB",
+    "319": "KY",
+    "351": "PA", "352": "PA", "353": "PA", "354": "PA", "355": "PA", "356": "PA", "357": "PA", "370": "PA", "371": "PA", "372": "PA", "373": "PA", "374": "PA",
+    "338": "US", "366": "US", "367": "US", "368": "US", "369": "US",
+    "477": "HK",
+    "538": "MH",
+    "563": "SG", "564": "SG", "565": "SG", "566": "SG",
+    "636": "LR", "637": "LR"
 }
 
-class VesselAddRequest(BaseModel):
-    mmsi: str
+stream_state = {
+    "connected": False,
+    "messages_received": 0,
+    "positions_archived": 0,
+    "started_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "last_message_at": None,
+    "retention_days": 30,
+    "bbox": DEFAULT_BBOX,
+    "reconnect_requested": False
+}
+
+# In-memory cache of last archived point per MMSI to downsample history efficiently:
+# { mmsi: (lat, lon, epoch_sec, sog, cog) }
+last_archived_cache: Dict[str, tuple] = {}
+
+DEFAULT_NAVY_VESSELS = [
+    {"mmsi": "211210160", "name": "Brandenburg", "pennant": "F 215", "category": "Fregatte", "class_name": "Klasse 123 (Brandenburg)", "homeport": "Wilhelmshaven"},
+    {"mmsi": "211210170", "name": "Schleswig-Holstein", "pennant": "F 216", "category": "Fregatte", "class_name": "Klasse 123 (Brandenburg)", "homeport": "Wilhelmshaven"},
+    {"mmsi": "211210180", "name": "Bayern", "pennant": "F 217", "category": "Fregatte", "class_name": "Klasse 123 (Brandenburg)", "homeport": "Wilhelmshaven"},
+    {"mmsi": "211210190", "name": "Mecklenburg-Vorpommern", "pennant": "F 218", "category": "Fregatte", "class_name": "Klasse 123 (Brandenburg)", "homeport": "Wilhelmshaven"},
+    {"mmsi": "211210150", "name": "Sachsen", "pennant": "F 219", "category": "Fregatte", "class_name": "Klasse 124 (Sachsen)", "homeport": "Wilhelmshaven"},
+    {"mmsi": "211210280", "name": "Hamburg", "pennant": "F 220", "category": "Fregatte", "class_name": "Klasse 124 (Sachsen)", "homeport": "Wilhelmshaven"},
+    {"mmsi": "211210200", "name": "Hamburg (Alt-MMSI)", "pennant": "F 220", "category": "Fregatte", "class_name": "Klasse 124 (Sachsen)", "homeport": "Wilhelmshaven"},
+    {"mmsi": "211906000", "name": "Hessen", "pennant": "F 221", "category": "Fregatte", "class_name": "Klasse 124 (Sachsen)", "homeport": "Wilhelmshaven"},
+    {"mmsi": "211920000", "name": "Baden-Württemberg", "pennant": "F 222", "category": "Fregatte", "class_name": "Klasse 125 (Baden-Württemberg)", "homeport": "Wilhelmshaven"},
+    {"mmsi": "211921000", "name": "Nordrhein-Westfalen", "pennant": "F 223", "category": "Fregatte", "class_name": "Klasse 125 (Baden-Württemberg)", "homeport": "Wilhelmshaven"},
+    {"mmsi": "211922000", "name": "Sachsen-Anhalt", "pennant": "F 224", "category": "Fregatte", "class_name": "Klasse 125 (Baden-Württemberg)", "homeport": "Wilhelmshaven"},
+    {"mmsi": "211923000", "name": "Rheinland-Pfalz", "pennant": "F 225", "category": "Fregatte", "class_name": "Klasse 125 (Baden-Württemberg)", "homeport": "Wilhelmshaven"},
+    {"mmsi": "211910000", "name": "Braunschweig", "pennant": "F 260", "category": "Korvette", "class_name": "Klasse 130 (Braunschweig)", "homeport": "Warnemünde"},
+    {"mmsi": "211911000", "name": "Magdeburg", "pennant": "F 261", "category": "Korvette", "class_name": "Klasse 130 (Braunschweig)", "homeport": "Warnemünde"},
+    {"mmsi": "211912000", "name": "Erfurt", "pennant": "F 262", "category": "Korvette", "class_name": "Klasse 130 (Braunschweig)", "homeport": "Warnemünde"},
+    {"mmsi": "211913000", "name": "Oldenburg", "pennant": "F 263", "category": "Korvette", "class_name": "Klasse 130 (Braunschweig)", "homeport": "Warnemünde"},
+    {"mmsi": "211914000", "name": "Ludwigshafen am Rhein", "pennant": "F 264", "category": "Korvette", "class_name": "Klasse 130 (Braunschweig)", "homeport": "Warnemünde"},
+    {"mmsi": "211832000", "name": "Köln", "pennant": "F 265", "category": "Korvette", "class_name": "Klasse 130 (Braunschweig 2. Los)", "homeport": "Warnemünde"},
+    {"mmsi": "211847000", "name": "Emden", "pennant": "F 266", "category": "Korvette", "class_name": "Klasse 130 (Braunschweig 2. Los)", "homeport": "Warnemünde"},
+    {"mmsi": "211848000", "name": "Karlsruhe", "pennant": "F 267", "category": "Korvette", "class_name": "Klasse 130 (Braunschweig 2. Los)", "homeport": "Warnemünde"},
+    {"mmsi": "211849000", "name": "Augsburg", "pennant": "F 268", "category": "Korvette", "class_name": "Klasse 130 (Braunschweig 2. Los)", "homeport": "Warnemünde"},
+    {"mmsi": "211850000", "name": "Lübeck", "pennant": "F 269", "category": "Korvette", "class_name": "Klasse 130 (Braunschweig 2. Los)", "homeport": "Warnemünde"},
+    {"mmsi": "211917000", "name": "Karlsruhe (2)", "pennant": "F 267", "category": "Korvette", "class_name": "Klasse 130 Batch 2", "homeport": "Warnemünde"},
+    {"mmsi": "211918000", "name": "Augsburg (2)", "pennant": "F 268", "category": "Korvette", "class_name": "Klasse 130 Batch 2", "homeport": "Warnemünde"},
+    {"mmsi": "211919000", "name": "Lübeck (2)", "pennant": "F 269", "category": "Korvette", "class_name": "Klasse 130 Batch 2", "homeport": "Warnemünde"},
+    {"mmsi": "211901000", "name": "U 31", "pennant": "S 181", "category": "U-Boot", "class_name": "Klasse 212A", "homeport": "Eckernförde"},
+    {"mmsi": "211902000", "name": "U 32", "pennant": "S 182", "category": "U-Boot", "class_name": "Klasse 212A", "homeport": "Eckernförde"},
+    {"mmsi": "211903000", "name": "U 33", "pennant": "S 183", "category": "U-Boot", "class_name": "Klasse 212A", "homeport": "Eckernförde"},
+    {"mmsi": "211904000", "name": "U 34", "pennant": "S 184", "category": "U-Boot", "class_name": "Klasse 212A", "homeport": "Eckernförde"},
+    {"mmsi": "211905000", "name": "U 35", "pennant": "S 185", "category": "U-Boot", "class_name": "Klasse 212A", "homeport": "Eckernförde"},
+    {"mmsi": "211907000", "name": "U 36", "pennant": "S 186", "category": "U-Boot", "class_name": "Klasse 212A", "homeport": "Eckernförde"},
+    {"mmsi": "211211730", "name": "Berlin", "pennant": "A 1411", "category": "EGV", "class_name": "Klasse 702 (Berlin)", "homeport": "Wilhelmshaven"},
+    {"mmsi": "211210420", "name": "Frankfurt am Main", "pennant": "A 1412", "category": "EGV", "class_name": "Klasse 702 (Berlin)", "homeport": "Wilhelmshaven"},
+    {"mmsi": "211210430", "name": "Bonn", "pennant": "A 1413", "category": "EGV", "class_name": "Klasse 702 (Berlin)", "homeport": "Wilhelmshaven"},
+    {"mmsi": "211927000", "name": "Bonn (2)", "pennant": "A 1413", "category": "EGV", "class_name": "Klasse 702 (Berlin)", "homeport": "Wilhelmshaven"},
+    {"mmsi": "211211470", "name": "Alster", "pennant": "A 50", "category": "Flottendienstboot", "class_name": "Klasse 423 (Oste)", "homeport": "Eckernförde"},
+    {"mmsi": "211211480", "name": "Oste", "pennant": "A 52", "category": "Flottendienstboot", "class_name": "Klasse 423 (Oste)", "homeport": "Eckernförde"},
+    {"mmsi": "211211490", "name": "Oker", "pennant": "A 53", "category": "Flottendienstboot", "class_name": "Klasse 423 (Oste)", "homeport": "Eckernförde"},
+    {"mmsi": "211211310", "name": "Alster (2)", "pennant": "A 50", "category": "Flottendienstboot", "class_name": "Klasse 423 (Oste)", "homeport": "Eckernförde"},
+    {"mmsi": "211211320", "name": "Oste (2)", "pennant": "A 52", "category": "Flottendienstboot", "class_name": "Klasse 423 (Oste)", "homeport": "Eckernförde"},
+    {"mmsi": "211211330", "name": "Oker (2)", "pennant": "A 53", "category": "Flottendienstboot", "class_name": "Klasse 423 (Oste)", "homeport": "Eckernförde"},
+    {"mmsi": "211211410", "name": "Elbe", "pennant": "A 511", "category": "Tender", "class_name": "Klasse 404 (Elbe)", "homeport": "Warnemünde"},
+    {"mmsi": "211211420", "name": "Mosel", "pennant": "A 512", "category": "Tender", "class_name": "Klasse 404 (Elbe)", "homeport": "Kiel"},
+    {"mmsi": "211211430", "name": "Rhein", "pennant": "A 513", "category": "Tender", "class_name": "Klasse 404 (Elbe)", "homeport": "Kiel"},
+    {"mmsi": "211211440", "name": "Werra", "pennant": "A 514", "category": "Tender", "class_name": "Klasse 404 (Elbe)", "homeport": "Kiel"},
+    {"mmsi": "211211450", "name": "Main", "pennant": "A 515", "category": "Tender", "class_name": "Klasse 404 (Elbe)", "homeport": "Eckernförde"},
+    {"mmsi": "211211460", "name": "Donau", "pennant": "A 516", "category": "Tender", "class_name": "Klasse 404 (Elbe)", "homeport": "Warnemünde"},
+    {"mmsi": "211211530", "name": "Main (2)", "pennant": "A 515", "category": "Tender", "class_name": "Klasse 404 (Elbe)", "homeport": "Eckernförde"},
+    {"mmsi": "211211540", "name": "Donau (2)", "pennant": "A 516", "category": "Tender", "class_name": "Klasse 404 (Elbe)", "homeport": "Warnemünde"},
+    {"mmsi": "211211710", "name": "Rottweil", "pennant": "M 1061", "category": "Minenjagdboot", "class_name": "Klasse 332 (Frankenthal)", "homeport": "Kiel"},
+    {"mmsi": "211211720", "name": "Sulzbach-Rosenberg", "pennant": "M 1062", "category": "Minenjagdboot", "class_name": "Klasse 332 (Frankenthal)", "homeport": "Kiel"},
+    {"mmsi": "211211740", "name": "Bad Bevensen", "pennant": "M 1063", "category": "Minenjagdboot", "class_name": "Klasse 332 (Frankenthal)", "homeport": "Kiel"},
+    {"mmsi": "211211750", "name": "Grömitz", "pennant": "M 1064", "category": "Minenjagdboot", "class_name": "Klasse 332 (Frankenthal)", "homeport": "Kiel"},
+    {"mmsi": "211211760", "name": "Dillingen", "pennant": "M 1065", "category": "Minenjagdboot", "class_name": "Klasse 332 (Frankenthal)", "homeport": "Kiel"},
+    {"mmsi": "211211770", "name": "Bad Rappenau", "pennant": "M 1067", "category": "Minenjagdboot", "class_name": "Klasse 332 (Frankenthal)", "homeport": "Kiel"},
+    {"mmsi": "211211780", "name": "Datteln", "pennant": "M 1068", "category": "Minenjagdboot", "class_name": "Klasse 332 (Frankenthal)", "homeport": "Kiel"},
+    {"mmsi": "211211790", "name": "Homburg", "pennant": "M 1069", "category": "Minenjagdboot", "class_name": "Klasse 332 (Frankenthal)", "homeport": "Kiel"},
+    {"mmsi": "211211810", "name": "Pegnitz", "pennant": "M 1090", "category": "Minenjagdboot", "class_name": "Klasse 332 (Frankenthal)", "homeport": "Kiel"},
+    {"mmsi": "211211820", "name": "Siegburg", "pennant": "M 1098", "category": "Minenjagdboot", "class_name": "Klasse 332 (Frankenthal)", "homeport": "Kiel"},
+    {"mmsi": "211211150", "name": "Fulda", "pennant": "M 1058", "category": "Minenjagdboot", "class_name": "Klasse 332 (Frankenthal)", "homeport": "Kiel"},
+    {"mmsi": "211211160", "name": "Weilheim", "pennant": "M 1059", "category": "Minenjagdboot", "class_name": "Klasse 332 (Frankenthal)", "homeport": "Kiel"},
+    {"mmsi": "211211510", "name": "Spessart", "pennant": "A 1442", "category": "Versorger", "class_name": "Klasse 704 (Rhön)", "homeport": "Kiel"},
+    {"mmsi": "211211520", "name": "Rhön", "pennant": "A 1443", "category": "Versorger", "class_name": "Klasse 704 (Rhön)", "homeport": "Wilhelmshaven"},
+    {"mmsi": "211211620", "name": "Spessart (2)", "pennant": "A 1442", "category": "Versorger", "class_name": "Klasse 704 (Rhön)", "homeport": "Kiel"},
+    {"mmsi": "211211630", "name": "Rhön (2)", "pennant": "A 1443", "category": "Versorger", "class_name": "Klasse 704 (Rhön)", "homeport": "Wilhelmshaven"},
+    {"mmsi": "211211600", "name": "Planet", "pennant": "A 1458", "category": "Forschungsschiff", "class_name": "Klasse 751 (Planet)", "homeport": "Eckernförde"},
+    {"mmsi": "211915000", "name": "Rügen", "pennant": "A 1459", "category": "Schlepper", "class_name": "Bergungsschlepper", "homeport": "Kiel"},
+    {"mmsi": "211916000", "name": "Borkum", "pennant": "Y 890", "category": "Schlepper", "class_name": "Hafenschlepper", "homeport": "Kiel"},
+    {"mmsi": "211211230", "name": "Gorch Fock", "pennant": "A 60", "category": "Schulschiff", "class_name": "Gorch-Fock-Klasse", "homeport": "Kiel"},
+    {"mmsi": "211212720", "name": "Munster", "pennant": "A 1433", "category": "Unterstützungseinheit", "class_name": "Klasse 740 (Mehrzweckboot)", "homeport": "Eckernförde"},
+    {"mmsi": "211212700", "name": "Baumholder", "pennant": "A 1434", "category": "Unterstützungseinheit", "class_name": "Klasse 740 (Mehrzweckboot)", "homeport": "Eckernförde"}
+]
+NAVY_MMSI_LOOKUP = {v["mmsi"]: v for v in DEFAULT_NAVY_VESSELS}
+
+class FleetCreateRequest(BaseModel):
     name: str
-    callsign: Optional[str] = ""
-    imo: Optional[str] = ""
-    category: Optional[str] = "Forschung"
-    class_name: Optional[str] = ""
-    homeport: Optional[str] = ""
+    icon: Optional[str] = "⭐"
+    color: Optional[str] = "#f59e0b"
 
-class SettingsRequest(BaseModel):
-    auto_refresh_daily: bool
-    show_historical_data: Optional[bool] = False
-    refresh_interval_minutes: Optional[int] = 10
-    api_key: Optional[str] = None
+class FleetVesselRequest(BaseModel):
+    mmsi: str
+    custom_name: Optional[str] = None
+    notes: Optional[str] = None
+
+class SettingsUpdate(BaseModel):
+    retention_days: int = 30
     aisstream_key: Optional[str] = None
+    datadocked_key: Optional[str] = None
+    carto_key: Optional[str] = None
+    lat_min: Optional[float] = None
+    lon_min: Optional[float] = None
+    lat_max: Optional[float] = None
+    lon_max: Optional[float] = None
+    bbox: Optional[List[List[List[float]]]] = None
 
-def safe_float(val, default=0.0):
-    if val is None or val == "" or val == "-":
-        return default
-    try:
-        return float(val)
-    except:
-        return default
+def get_country_from_mmsi(mmsi: str) -> str:
+    if len(mmsi) == 9:
+        return MID_COUNTRY_MAP.get(mmsi[:3], mmsi[:3])
+    return "-"
 
-def normalize_iso_timestamp(ts_val) -> Optional[str]:
-    """Converts various AIS timestamp formats into strict ISO-8601 UTC (YYYY-MM-DDTHH:MM:SSZ)."""
+def classify_ship_type(type_code: Optional[int], mmsi: str = "", name: str = "") -> tuple[str, str]:
+    """Gibt (Kategorie-Schlüssel, Anzeigename) anhand des AIS ShipType-Codes oder der MMSI zurück."""
+    tc = int(type_code) if type_code is not None else 0
+    upper_name = (name or "").upper()
+
+    if mmsi in NAVY_MMSI_LOOKUP:
+        nv = NAVY_MMSI_LOOKUP[mmsi]
+        return ("Military", f"Deutsche Marine ({nv['category']})")
+
+    if tc == 35 or mmsi.startswith("2119") or mmsi.startswith("21121") or "WARSHIP" in upper_name or "FGS " in upper_name:
+        if tc == 35 or "FGS " in upper_name or "WARSHIP" in upper_name or mmsi.startswith("21121") or mmsi.startswith("2119"):
+            return ("Military", "Militär / Marine")
+    if tc == 55 or "POLIZEI" in upper_name or "ZOLL" in upper_name or "COAST GUARD" in upper_name or "BP " in upper_name:
+        return ("LawEnforcement", "Behörde / Küstenwache")
+    if tc == 51 or "SAR" in upper_name or "RESCUE" in upper_name:
+        return ("SAR", "Seenotrettung (SAR)")
+    if tc == 52 or tc == 31 or tc == 32:
+        return ("Tug", "Schlepper")
+    if tc == 50:
+        return ("Pilot", "Lotse")
+    if tc == 30:
+        return ("Fishing", "Fischerei")
+    if tc == 36:
+        return ("Sailing", "Segelschiff")
+    if tc == 37:
+        return ("Pleasure", "Sportboot / Yacht")
+    if 40 <= tc <= 49:
+        return ("HSC", "Schnellfähre (HSC)")
+    if 60 <= tc <= 69:
+        return ("Passenger", "Passagierschiff / Fähre")
+    if 70 <= tc <= 79:
+        return ("Cargo", "Frachtschiff")
+    if 80 <= tc <= 89:
+        return ("Tanker", "Tanker")
+    if tc in (33, 34, 53, 54, 58):
+        return ("Special", "Spezial- / Arbeitsschiff")
+    return ("Other", "Sonstige / Unbekannt")
+
+def normalize_iso_timestamp(ts_val) -> str:
     if not ts_val:
-        return None
+        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     s = str(ts_val).strip()
-    if not s:
-        return None
     m = re.match(r'^(\d{4}-\d{2}-\d{2})[T\s](\d{2}:\d{2}:\d{2})(?:\.\d+)?(?:\s*\+00:?00(?:\s*UTC)?|Z)?$', s)
     if m:
         return f"{m.group(1)}T{m.group(2)}Z"
     try:
-        clean_dd = re.sub(r'\s+UTC$', '', s)
-        dt = datetime.strptime(clean_dd, "%b %d, %Y %H:%M")
-        return dt.strftime("%Y-%m-%dT%H:%M:00Z")
-    except:
-        pass
-    try:
         dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
         return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     except:
-        pass
-    return s
+        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-def normalize_position_dict(pos: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Ensures all timestamp, status, and source fields are consistently populated in ISO-8601 format."""
-    if not pos or not isinstance(pos, dict):
-        return pos
-    raw_ts = (
-        pos.get("positionReceived")
-        or pos.get("updateTime")
-        or pos.get("timestamp")
-        or pos.get("last_pos_Time")
-        or pos.get("fetched_at")
-    )
-    iso_ts = normalize_iso_timestamp(raw_ts)
-    if iso_ts:
-        pos["timestamp"] = iso_ts
-        pos["positionReceived"] = iso_ts
-        pos["updateTime"] = iso_ts
-        if not pos.get("fetched_at"):
-            pos["fetched_at"] = iso_ts
-        else:
-            pos["fetched_at"] = normalize_iso_timestamp(pos["fetched_at"]) or iso_ts
+def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 6371000.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2.0) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2.0) ** 2
+    return 2.0 * R * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
 
-    stat = pos.get("navigationalStatus") or pos.get("status") or "Active (AIS)"
-    pos["status"] = stat
-    pos["navigationalStatus"] = stat
+def load_config() -> Dict[str, Any]:
+    default_cfg = {
+        "retention_days": 30,
+        "aisstream_key": AISSTREAM_KEY,
+        "carto_key": CARTO_KEY,
+        "bbox": DEFAULT_BBOX
+    }
+    os.makedirs(DATA_DIR, exist_ok=True)
+    if not os.path.exists(CONFIG_FILE):
+        save_config(default_cfg)
+        return default_cfg
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+            for k, v in default_cfg.items():
+                if k not in cfg:
+                    cfg[k] = v
+            return cfg
+    except:
+        return default_cfg
 
-    src = pos.get("dataSource") or pos.get("source") or "AIS"
-    pos["source"] = src
-    pos["dataSource"] = src
-    return pos
+def save_config(cfg: Dict[str, Any]):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
 
-# --- SQLITE ARCHIVE DATABASE ---
 def init_db():
     os.makedirs(DATA_DIR, exist_ok=True)
     with sqlite3.connect(DB_FILE) as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS vessels (
+                mmsi TEXT PRIMARY KEY,
+                name TEXT,
+                callsign TEXT,
+                imo TEXT,
+                ship_type INTEGER,
+                category TEXT,
+                category_label TEXT,
+                country TEXT,
+                length REAL,
+                width REAL,
+                draught REAL,
+                destination TEXT,
+                eta TEXT,
+                latitude REAL,
+                longitude REAL,
+                speed REAL,
+                course REAL,
+                heading REAL,
+                nav_status TEXT,
+                first_seen TEXT,
+                last_seen TEXT,
+                position_count INTEGER DEFAULT 0
+            )
+        """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS position_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -144,575 +321,741 @@ def init_db():
                 course REAL,
                 heading REAL,
                 status TEXT,
-                destination TEXT,
-                timestamp TEXT NOT NULL,
-                source TEXT
+                timestamp TEXT NOT NULL
             )
         """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_mmsi_time ON position_history(mmsi, timestamp)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_hist_mmsi_time ON position_history(mmsi, timestamp)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_hist_time ON position_history(timestamp)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_vessels_last_seen ON vessels(last_seen)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_vessels_category ON vessels(category)")
 
-def record_position_to_archive(mmsi: str, lat, lon, speed=None, course=None, heading=None, status=None, destination=None, timestamp=None, source="AIS"):
-    f_lat = safe_float(lat, None)
-    f_lon = safe_float(lon, None)
-    if f_lat is None or f_lon is None:
-        return
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS fleets (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                icon TEXT DEFAULT '⭐',
+                color TEXT DEFAULT '#3b82f6',
+                is_system INTEGER DEFAULT 0
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS fleet_vessels (
+                fleet_id TEXT NOT NULL,
+                mmsi TEXT NOT NULL,
+                custom_name TEXT,
+                notes TEXT,
+                PRIMARY KEY (fleet_id, mmsi)
+            )
+        """)
 
-    f_speed = safe_float(speed, None)
-    f_course = safe_float(course, None)
-    f_heading = safe_float(heading, None)
+        # Seed Standard-Flotten
+        cur = conn.cursor()
+        cur.execute("INSERT OR IGNORE INTO fleets (id, name, icon, color, is_system) VALUES ('navy', 'Deutsche Marine', '⚓', '#3b82f6', 1)")
+        cur.execute("INSERT OR IGNORE INTO fleets (id, name, icon, color, is_system) VALUES ('my_fleet', 'Meine Flotte', '⭐', '#f59e0b', 1)")
+        cur.execute("INSERT OR IGNORE INTO fleets (id, name, icon, color, is_system) VALUES ('sar_authorities', 'SAR & Küstenwache', '🛟', '#10b981', 1)")
 
-    timestamp = normalize_iso_timestamp(timestamp)
-    if not timestamp:
-        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    try:
-        with sqlite3.connect(DB_FILE) as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT latitude, longitude, timestamp FROM position_history WHERE mmsi = ? ORDER BY id DESC LIMIT 1", (mmsi,))
-            row = cur.fetchone()
-            if row:
-                last_lat, last_lon, last_time = row
-                if abs(last_lat - f_lat) < 0.0001 and abs(last_lon - f_lon) < 0.0001:
-                    return
-            conn.execute("""
-                INSERT INTO position_history (mmsi, latitude, longitude, speed, course, heading, status, destination, timestamp, source)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (mmsi, f_lat, f_lon, f_speed, f_course, f_heading, status, destination, timestamp, source))
-    except Exception as e:
-        logger.error(f"Error saving to archive db: {e}")
+        for nv in DEFAULT_NAVY_VESSELS:
+            label = f"{nv['name']} ({nv['pennant']})" if nv.get("pennant") else nv["name"]
+            cur.execute(
+                "INSERT OR IGNORE INTO fleet_vessels (fleet_id, mmsi, custom_name, notes) VALUES (?, ?, ?, ?)",
+                ("navy", nv["mmsi"], label, f"{nv.get('category', '')} • {nv.get('homeport', '')}")
+            )
+            # Falls das Schiff schon in vessels ist, aber noch 'MMSI ...' heißt, direkt mit Klarnamen veredeln
+            cur.execute(
+                "UPDATE vessels SET name = ?, category = 'Military', category_label = ? WHERE mmsi = ? AND (name IS NULL OR name LIKE 'MMSI %')",
+                (label, f"Deutsche Marine ({nv['category']})", nv["mmsi"])
+            )
+        conn.commit()
 
-def get_track_history(
-    mmsi: str,
-    start_time: Optional[str] = None,
-    end_time: Optional[str] = None,
-    limit: int = 5000
-) -> List[Dict[str, Any]]:
-    try:
-        with sqlite3.connect(DB_FILE) as conn:
-            conn.row_factory = sqlite3.Row
-            cur = conn.cursor()
-            
-            query = """
-                SELECT latitude, longitude, speed, course, heading, status, timestamp, source
-                FROM position_history
-                WHERE mmsi = ?
-            """
-            params: List[Any] = [mmsi]
-            
-            if start_time:
-                clean_start = start_time.strip().replace('T', ' ')
-                if len(clean_start) == 16:
-                    clean_start += ':00'
-                query += " AND replace(replace(timestamp, 'T', ' '), 'Z', '') >= ?"
-                params.append(clean_start)
-                
-            if end_time:
-                clean_end = end_time.strip().replace('T', ' ')
-                if len(clean_end) == 16:
-                    clean_end += ':59'
-                query += " AND replace(replace(timestamp, 'T', ' '), 'Z', '') <= ?"
-                params.append(clean_end)
-                
-            query += " ORDER BY replace(replace(timestamp, 'T', ' '), 'Z', '') ASC LIMIT ?"
-            params.append(limit)
-            
-            cur.execute(query, params)
-            rows = cur.fetchall()
-            result = []
-            for r in rows:
-                d = dict(r)
-                iso_ts = normalize_iso_timestamp(d.get("timestamp"))
-                if iso_ts:
-                    d["timestamp"] = iso_ts
-                    d["positionReceived"] = iso_ts
-                    d["updateTime"] = iso_ts
-                stat = d.get("status") or "Active (AIS)"
-                d["status"] = stat
-                d["navigationalStatus"] = stat
-                src = d.get("source") or "AIS"
-                d["source"] = src
-                d["dataSource"] = src
-                result.append(d)
-            return result
-    except Exception as e:
-        logger.error(f"Error fetching track history: {e}")
-        return []
+def should_archive_point(mmsi: str, lat: float, lon: float, sog: float, cog: float, now_epoch: float) -> bool:
+    """Intelligentes Downsampling für 30 Tage Speicherung tausender Schiffe."""
+    prev = last_archived_cache.get(mmsi)
+    if not prev:
+        last_archived_cache[mmsi] = (lat, lon, now_epoch, sog, cog)
+        return True
 
-def get_track_range(mmsi: str) -> Dict[str, Any]:
-    try:
-        with sqlite3.connect(DB_FILE) as conn:
-            cur = conn.cursor()
-            cur.execute("""
-                SELECT min(timestamp), max(timestamp), count(*) 
-                FROM position_history 
-                WHERE mmsi = ?
-            """, (mmsi,))
-            row = cur.fetchone()
-            if row and row[2] > 0:
-                return {
-                    "mmsi": mmsi,
-                    "min_time": row[0],
-                    "max_time": row[1],
-                    "total_points": row[2]
-                }
-    except Exception as e:
-        logger.error(f"Error fetching track range: {e}")
-    return {"mmsi": mmsi, "min_time": None, "max_time": None, "total_points": 0}
+    p_lat, p_lon, p_epoch, p_sog, p_cog = prev
+    dt = now_epoch - p_epoch
+    if dt < 45:
+        return False
 
-def load_vessels() -> List[Dict[str, Any]]:
-    seed_data = []
-    if os.path.exists(SEED_FILE):
-        try:
-            with open(SEED_FILE, "r", encoding="utf-8") as f:
-                seed_data = json.load(f)
-        except Exception as e:
-            logger.error(f"Error reading seed file: {e}")
+    dist_m = haversine_m(p_lat, p_lon, lat, lon)
+    cog_diff = abs((cog or 0.0) - (p_cog or 0.0))
+    if cog_diff > 180:
+        cog_diff = 360 - cog_diff
 
-    if not os.path.exists(VESSELS_FILE):
-        if seed_data:
-            save_vessels(seed_data)
-        return seed_data
+    # Wenn Schiff liegt (< 0.5 kn) und sich kaum bewegt (< 80m): alle 20 Minuten 1 Punkt speichern
+    if (sog or 0.0) < 0.5 and dist_m < 80:
+        if dt >= 1200:
+            last_archived_cache[mmsi] = (lat, lon, now_epoch, sog, cog)
+            return True
+        return False
 
-    try:
-        with open(VESSELS_FILE, "r", encoding="utf-8") as f:
-            vessels = json.load(f)
-        
-        existing_mmsi = {str(v.get("mmsi")) for v in vessels}
-        changed = False
-        for s in seed_data:
-            if str(s.get("mmsi")) not in existing_mmsi:
-                vessels.append(s)
-                changed = True
-        for v in vessels:
-            if v.get("last_position"):
-                normalize_position_dict(v["last_position"])
-        if changed:
-            save_vessels(vessels)
-        return vessels
-    except Exception as e:
-        logger.error(f"Error reading vessels file: {e}")
-        return []
+    # Wenn in Fahrt: speichern wenn >= 180s vergangen ODER (>= 60s und Kursänderung >= 12° oder Distanz >= 350m)
+    if dt >= 180 or (dt >= 60 and (cog_diff >= 12.0 or dist_m >= 350.0)):
+        last_archived_cache[mmsi] = (lat, lon, now_epoch, sog, cog)
+        return True
 
-def save_vessels(data: List[Dict[str, Any]]):
-    os.makedirs(DATA_DIR, exist_ok=True)
-    with open(VESSELS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    return False
 
-def load_config() -> Dict[str, Any]:
-    default_cfg = {
-        "auto_refresh_daily": False,
-        "show_historical_data": False,
-        "refresh_interval_minutes": 10,
-        "api_key": API_KEY,
-        "aisstream_key": AISSTREAM_KEY
-    }
-    if not os.path.exists(CONFIG_FILE):
-        save_config(default_cfg)
-        return default_cfg
-    try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-            changed = False
-            for k, v in default_cfg.items():
-                if k not in cfg:
-                    cfg[k] = v
-                    changed = True
-            if changed:
-                save_config(cfg)
-            return cfg
-    except:
-        return default_cfg
-
-def save_config(cfg: Dict[str, Any]):
-    os.makedirs(DATA_DIR, exist_ok=True)
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
-
-# --- AISSTREAM REAL-TIME LISTENER ---
-async def aisstream_listener():
-    """Background task connecting to AISStream.io WebSocket for real-time AIS reports."""
+async def aisstream_worker():
+    """Verbindet sich mit AISStream.io für die gesamte Deutsche Bucht + Elbe/Weser/NOK + westliche Ostsee."""
     while True:
         cfg = load_config()
         key = cfg.get("aisstream_key") or AISSTREAM_KEY
+        bbox = cfg.get("bbox") or DEFAULT_BBOX
+        stream_state["retention_days"] = cfg.get("retention_days", 30)
+        stream_state["bbox"] = bbox
+        stream_state["reconnect_requested"] = False
+
         if not key:
-            refresh_state["aisstream_connected"] = False
+            stream_state["connected"] = False
             await asyncio.sleep(10)
             continue
 
-        vessels = load_vessels()
-        mmsi_list = [str(v["mmsi"]).strip() for v in vessels if v.get("mmsi")]
-
-        if not mmsi_list:
-            await asyncio.sleep(5)
-            continue
-
         url = "wss://stream.aisstream.io/v0/stream"
-        logger.info(f"Connecting to AISStream.io for {len(mmsi_list)} vessels...")
-        
+        logger.info(f"Connecting to AISStream.io for BBox {bbox}...")
+
         try:
-            async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
-                refresh_state["aisstream_connected"] = True
+            async with websockets.connect(url, ping_interval=20, ping_timeout=20, max_queue=2048) as ws:
+                stream_state["connected"] = True
                 sub = {
                     "APIKey": key,
-                    "BoundingBoxes": [[[-90, -180], [90, 180]]],
-                    "FiltersShipMMSI": mmsi_list[:250],
-                    "FilterMessageTypes": ["PositionReport", "ShipStaticData"]
+                    "BoundingBoxes": bbox,
+                    "FilterMessageTypes": [
+                        "PositionReport",
+                        "StandardClassBPositionReport",
+                        "ExtendedClassBPositionReport",
+                        "ShipStaticData",
+                        "StaticDataReport"
+                    ]
                 }
                 await ws.send(json.dumps(sub))
-                logger.info("AISStream subscription active. Listening for real-time messages...")
+                logger.info("AISStream regional subscription active!")
+
+                batch_positions = []
+                batch_statics = []
+                last_flush = time.time()
 
                 async for raw in ws:
+                    if stream_state.get("reconnect_requested"):
+                        logger.info("BBox or settings changed -> reconnecting AISStream...")
+                        flush_batches(batch_positions, batch_statics)
+                        break
                     try:
                         msg = json.loads(raw)
                         m_type = msg.get("MessageType")
                         meta = msg.get("MetaData", {})
-                        mmsi = str(meta.get("MMSI") or "")
-                        ship_name = (meta.get("ShipName") or "").strip()
-
-                        if not mmsi:
+                        mmsi = str(meta.get("MMSI") or "").strip()
+                        if not mmsi or len(mmsi) < 7:
                             continue
 
-                        refresh_state["aisstream_messages"] += 1
+                        ship_name = (meta.get("ShipName") or "").strip().strip("@")
+                        iso_ts = normalize_iso_timestamp(meta.get("time_utc"))
+                        now_epoch = time.time()
 
-                        current_vessels = load_vessels()
-                        target = None
-                        for v in current_vessels:
-                            if str(v.get("mmsi")) == mmsi:
-                                target = v
-                                break
+                        stream_state["messages_received"] += 1
+                        stream_state["last_message_at"] = iso_ts
 
-                        if not target:
-                            continue
+                        message_body = msg.get("Message", {}).get(m_type, {})
 
-                        now_iso = datetime.now(timezone.utc).isoformat()
-                        if not target.get("last_position"):
-                            target["last_position"] = {}
+                        if m_type in ("PositionReport", "StandardClassBPositionReport", "ExtendedClassBPositionReport"):
+                            lat = message_body.get("Latitude", meta.get("latitude"))
+                            lon = message_body.get("Longitude", meta.get("longitude"))
+                            if lat is None or lon is None or abs(lat) > 90 or abs(lon) > 180 or (lat == 0 and lon == 0):
+                                continue
 
-                        pos = target["last_position"]
+                            sog = float(message_body.get("Sog") or 0.0)
+                            cog = float(message_body.get("Cog") or 0.0)
+                            hdg = message_body.get("TrueHeading")
+                            if hdg is None or hdg >= 360:
+                                hdg = cog
+                            else:
+                                hdg = float(hdg)
 
-                        if ship_name:
-                            target["current_ais_name"] = ship_name
-                            pos["name"] = ship_name
+                            nav_code = message_body.get("NavigationalStatus", 15)
+                            nav_text = NAV_STATUS_MAP.get(nav_code, "Aktiv (AIS)")
 
-                        if m_type == "PositionReport":
-                            p = msg.get("Message", {}).get("PositionReport", {})
-                            lat = p.get("Latitude")
-                            lon = p.get("Longitude")
-                            sog = p.get("Sog")
-                            cog = p.get("Cog")
-                            hdg = p.get("TrueHeading")
-                            nav_stat = p.get("NavigationalStatus")
-                            stat_text = NAV_STATUS_MAP.get(nav_stat, "Active (AIS)")
+                            ship_type_ext = message_body.get("Type")
+                            archive_flag = should_archive_point(mmsi, float(lat), float(lon), sog, cog, now_epoch)
 
-                            if lat is not None and lon is not None:
-                                iso_time = normalize_iso_timestamp(meta.get("time_utc")) or now_iso
-                                pos["latitude"] = str(lat)
-                                pos["longitude"] = str(lon)
-                                pos["speed"] = str(sog) if sog is not None else "0.0"
-                                pos["course"] = str(cog) if cog is not None else "0"
-                                pos["heading"] = str(hdg) if hdg is not None and hdg < 511 else str(cog or 0)
-                                pos["status"] = stat_text
-                                pos["navigationalStatus"] = stat_text
-                                pos["source"] = "AISStream Live"
-                                pos["dataSource"] = "AISStream Live"
-                                pos["timestamp"] = iso_time
-                                pos["positionReceived"] = iso_time
-                                pos["updateTime"] = iso_time
-                                pos["fetched_at"] = normalize_iso_timestamp(now_iso) or iso_time
-                                save_vessels(current_vessels)
-
-                                record_position_to_archive(
-                                    mmsi=mmsi,
-                                    lat=float(lat),
-                                    lon=float(lon),
-                                    speed=float(sog) if sog is not None else None,
-                                    course=float(cog) if cog is not None else None,
-                                    heading=float(hdg) if hdg is not None else None,
-                                    status=stat_text,
-                                    destination=pos.get("destination"),
-                                    timestamp=iso_time,
-                                    source="AISStream Live"
-                                )
-                                logger.info(f"Live AIS: {target.get('name')} ({mmsi}) @ {lat}, {lon}")
+                            batch_positions.append({
+                                "mmsi": mmsi,
+                                "name": ship_name,
+                                "lat": round(float(lat), 6),
+                                "lon": round(float(lon), 6),
+                                "sog": round(sog, 1),
+                                "cog": round(cog, 1),
+                                "hdg": round(hdg, 1),
+                                "nav_status": nav_text,
+                                "ship_type": ship_type_ext,
+                                "ts": iso_ts,
+                                "archive": archive_flag
+                            })
 
                         elif m_type == "ShipStaticData":
-                            s = msg.get("Message", {}).get("ShipStaticData", {})
-                            dest = s.get("Destination")
-                            call = s.get("CallSign")
-                            if dest:
-                                pos["destination"] = dest.strip()
-                            if call:
-                                target["callsign"] = call.strip()
-                            save_vessels(current_vessels)
+                            callsign = (message_body.get("CallSign") or "").strip().strip("@")
+                            dest = (message_body.get("Destination") or "").strip().strip("@")
+                            imo = str(message_body.get("ImoNumber") or "")
+                            if imo == "0":
+                                imo = ""
+                            ship_type = message_body.get("Type")
+                            draught = message_body.get("MaximumStaticDraught")
+                            dim = message_body.get("Dimension") or {}
+                            length = (dim.get("A") or 0) + (dim.get("B") or 0)
+                            width = (dim.get("C") or 0) + (dim.get("D") or 0)
+                            s_name = (message_body.get("Name") or ship_name or "").strip().strip("@")
+
+                            batch_statics.append({
+                                "mmsi": mmsi,
+                                "name": s_name,
+                                "callsign": callsign,
+                                "imo": imo,
+                                "ship_type": ship_type,
+                                "length": length if length > 0 else None,
+                                "width": width if width > 0 else None,
+                                "draught": draught if draught and draught > 0 else None,
+                                "destination": dest,
+                                "ts": iso_ts
+                            })
+
+                        elif m_type == "StaticDataReport":
+                            rep_a = message_body.get("ReportA", {})
+                            rep_b = message_body.get("ReportB", {})
+                            s_name = (rep_a.get("Name") or ship_name or "").strip().strip("@")
+                            callsign = (rep_b.get("CallSign") or "").strip().strip("@")
+                            ship_type = rep_b.get("ShipType")
+                            dim = rep_b.get("Dimension") or {}
+                            length = (dim.get("A") or 0) + (dim.get("B") or 0)
+                            width = (dim.get("C") or 0) + (dim.get("D") or 0)
+
+                            batch_statics.append({
+                                "mmsi": mmsi,
+                                "name": s_name,
+                                "callsign": callsign,
+                                "imo": None,
+                                "ship_type": ship_type,
+                                "length": length if length > 0 else None,
+                                "width": width if width > 0 else None,
+                                "draught": None,
+                                "destination": None,
+                                "ts": iso_ts
+                            })
+
+                        # Flush batch to SQLite every 1.5 seconds or 80 items
+                        if (time.time() - last_flush) >= 1.5 or (len(batch_positions) + len(batch_statics)) >= 80:
+                            flush_batches(batch_positions, batch_statics)
+                            batch_positions.clear()
+                            batch_statics.clear()
+                            last_flush = time.time()
 
                     except Exception as parse_err:
-                        logger.warning(f"Error parsing AISStream message: {parse_err}")
+                        logger.warning(f"Parse error: {parse_err}")
 
         except Exception as conn_err:
-            refresh_state["aisstream_connected"] = False
-            logger.warning(f"AISStream disconnected ({conn_err}). Retrying in 5s...")
+            stream_state["connected"] = False
+            logger.warning(f"AISStream disconnected ({conn_err}). Reconnecting in 5s...")
             await asyncio.sleep(5)
 
-# --- REST API LOOKUP (OPTIONAL DATADOCKED / VESSELFINDER INTEGRATION) ---
-async def fetch_vessel_location(mmsi_or_imo: str, api_key: str) -> Optional[Dict[str, Any]]:
-    if not api_key:
-        return None
-    url = f"https://datadocked.com/api/vessels_operations/get-vessel-location?imo_or_mmsi={mmsi_or_imo}"
-    headers = {"x-api-key": api_key}
+def flush_batches(positions: List[Dict[str, Any]], statics: List[Dict[str, Any]]):
+    if not positions and not statics:
+        return
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            res = await client.get(url, headers=headers)
-            if res.status_code == 200:
-                data = res.json()
-                if isinstance(data, dict) and "latitude" in data and data.get("latitude"):
-                    data["fetched_at"] = datetime.now(timezone.utc).isoformat()
-                    return data
-    except Exception as e:
-        logger.error(f"Error fetching location for {mmsi_or_imo}: {e}")
-    return None
+        with sqlite3.connect(DB_FILE) as conn:
+            cur = conn.cursor()
+            archived_now = 0
 
-async def run_refresh_all_task():
-    global refresh_state
-    if refresh_state["is_refreshing"]:
-        return
-    cfg = load_config()
-    current_key = cfg.get("api_key") or API_KEY
-    if not current_key:
-        logger.info("No REST API key configured for bulk refresh.")
-        return
-        
-    vessels = load_vessels()
-    refresh_state["is_refreshing"] = True
-    refresh_state["total"] = len(vessels)
-    refresh_state["current"] = 0
-    refresh_state["errors"] = []
-    try:
-        for idx, vessel in enumerate(vessels):
-            refresh_state["current"] = idx + 1
-            mmsi = vessel.get("mmsi")
-            try:
-                pos = await fetch_vessel_location(mmsi, current_key)
-                if pos:
-                    vessel["last_position"] = pos
-                    record_position_to_archive(
-                        mmsi=mmsi,
-                        lat=float(pos["latitude"]),
-                        lon=float(pos["longitude"]),
-                        speed=float(pos.get("speed") or 0),
-                        course=float(pos.get("course") or 0),
-                        heading=float(pos.get("heading") or 0),
-                        status=pos.get("navigationalStatus"),
-                        destination=pos.get("destination"),
-                        timestamp=pos.get("positionReceived") or pos.get("fetched_at"),
-                        source="REST API"
-                    )
+            for p in positions:
+                mmsi = p["mmsi"]
+                country = get_country_from_mmsi(mmsi)
+                nv = NAVY_MMSI_LOOKUP.get(mmsi)
+                fallback_name = f"{nv['name']} ({nv['pennant']})" if nv and nv.get("pennant") else (nv["name"] if nv else f"MMSI {mmsi}")
+                cat, cat_label = classify_ship_type(p.get("ship_type"), mmsi, p.get("name") or fallback_name)
+                inc = 1 if p["archive"] else 0
+
+                cur.execute("SELECT name, ship_type, category, category_label, position_count FROM vessels WHERE mmsi = ?", (mmsi,))
+                row = cur.fetchone()
+                if not row:
+                    cur.execute("""
+                        INSERT INTO vessels (
+                            mmsi, name, ship_type, category, category_label, country,
+                            latitude, longitude, speed, course, heading, nav_status,
+                            first_seen, last_seen, position_count
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        mmsi, p["name"] or fallback_name, p.get("ship_type"), cat, cat_label, country,
+                        p["lat"], p["lon"], p["sog"], p["cog"], p["hdg"], p["nav_status"],
+                        p["ts"], p["ts"], inc
+                    ))
                 else:
-                    refresh_state["errors"].append(f"{vessel.get('name', mmsi)}: No recent position")
-            except Exception as e:
-                refresh_state["errors"].append(f"{vessel.get('name', mmsi)}: {str(e)}")
-            await asyncio.sleep(0.5)
-        save_vessels(vessels)
-        refresh_state["last_run"] = datetime.now(timezone.utc).isoformat()
-    finally:
-        refresh_state["is_refreshing"] = False
+                    ex_name, ex_type, ex_cat, ex_cat_label, ex_count = row
+                    if p["name"]:
+                        new_name = p["name"]
+                    elif ex_name and not ex_name.startswith("MMSI "):
+                        new_name = ex_name
+                    else:
+                        new_name = fallback_name
+                    new_type = p["ship_type"] if p.get("ship_type") else ex_type
+                    if (new_type and (not ex_cat or ex_cat == "Other")) or nv:
+                        new_cat, new_cat_label = classify_ship_type(new_type, mmsi, new_name or "")
+                    else:
+                        new_cat, new_cat_label = ex_cat or cat, ex_cat_label or cat_label
+
+                    cur.execute("""
+                        UPDATE vessels SET
+                            name = ?,
+                            ship_type = ?,
+                            category = ?,
+                            category_label = ?,
+                            latitude = ?,
+                            longitude = ?,
+                            speed = ?,
+                            course = ?,
+                            heading = ?,
+                            nav_status = ?,
+                            last_seen = ?,
+                            position_count = ?
+                        WHERE mmsi = ?
+                    """, (
+                        new_name, new_type, new_cat, new_cat_label,
+                        p["lat"], p["lon"], p["sog"], p["cog"], p["hdg"], p["nav_status"],
+                        p["ts"], (ex_count or 0) + inc, mmsi
+                    ))
+
+                if p["archive"]:
+                    cur.execute("""
+                        INSERT INTO position_history (mmsi, latitude, longitude, speed, course, heading, status, timestamp)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (mmsi, p["lat"], p["lon"], p["sog"], p["cog"], p["hdg"], p["nav_status"], p["ts"]))
+                    archived_now += 1
+
+            for s in statics:
+                mmsi = s["mmsi"]
+                country = get_country_from_mmsi(mmsi)
+                cat, cat_label = classify_ship_type(s.get("ship_type"), mmsi, s.get("name") or "")
+
+                cur.execute("SELECT name, callsign, imo, ship_type, length, width, draught, destination FROM vessels WHERE mmsi = ?", (mmsi,))
+                row = cur.fetchone()
+                if not row:
+                    cur.execute("""
+                        INSERT INTO vessels (
+                            mmsi, name, callsign, imo, ship_type, category, category_label, country,
+                            length, width, draught, destination, first_seen, last_seen, position_count
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                    """, (
+                        mmsi, s["name"] or f"MMSI {mmsi}", s["callsign"], s["imo"],
+                        s["ship_type"], cat, cat_label, country,
+                        s["length"], s["width"], s["draught"], s["destination"],
+                        s["ts"], s["ts"]
+                    ))
+                else:
+                    ex_name, ex_call, ex_imo, ex_type, ex_len, ex_wid, ex_dr, ex_dest = row
+                    new_name = s["name"] or ex_name
+                    new_call = s["callsign"] or ex_call
+                    new_imo = s["imo"] or ex_imo
+                    new_type = s["ship_type"] if s["ship_type"] else ex_type
+                    new_cat, new_cat_label = classify_ship_type(new_type, mmsi, new_name or "")
+                    new_len = s["length"] or ex_len
+                    new_wid = s["width"] or ex_wid
+                    new_dr = s["draught"] or ex_dr
+                    new_dest = s["destination"] if s["destination"] else ex_dest
+
+                    cur.execute("""
+                        UPDATE vessels SET
+                            name = ?, callsign = ?, imo = ?, ship_type = ?,
+                            category = ?, category_label = ?, country = ?,
+                            length = ?, width = ?, draught = ?, destination = ?,
+                            last_seen = ?
+                        WHERE mmsi = ?
+                    """, (
+                        new_name, new_call, new_imo, new_type,
+                        new_cat, new_cat_label, country,
+                        new_len, new_wid, new_dr, new_dest,
+                        s["ts"], mmsi
+                    ))
+
+            conn.commit()
+            stream_state["positions_archived"] += archived_now
+    except Exception as e:
+        logger.error(f"Error flushing batches to SQLite: {e}")
+
+async def retention_cleanup_worker():
+    """Löscht automatisch alle Positionsdaten aus position_history, die älter als retention_days (Standard: 30 Tage) sind.
+    Die MMSI-Stammdatenbank in 'vessels' bleibt dauerhaft erhalten!"""
+    while True:
+        try:
+            cfg = load_config()
+            days = max(1, int(cfg.get("retention_days", 30)))
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            with sqlite3.connect(DB_FILE) as conn:
+                cur = conn.cursor()
+                cur.execute("DELETE FROM position_history WHERE timestamp < ?", (cutoff,))
+                deleted = cur.rowcount
+                conn.commit()
+                if deleted > 0:
+                    logger.info(f"30-Day Retention Cleanup: Removed {deleted} old track points before {cutoff}")
+        except Exception as e:
+            logger.error(f"Retention cleanup error: {e}")
+        await asyncio.sleep(3600)  # Einmal pro Stunde prüfen
 
 # --- API ENDPOINTS ---
-@app.get("/api/vessels")
-async def get_vessels(include_historical: Optional[bool] = None):
-    cfg = load_config()
-    show_hist = include_historical if include_historical is not None else bool(cfg.get("show_historical_data", False))
-    vessels = load_vessels()
-    now_utc = datetime.now(timezone.utc)
-    result_vessels = []
-    for v in vessels:
-        v_copy = dict(v)
-        pos = v_copy.get("last_position")
-        if pos and pos.get("latitude") and pos.get("longitude"):
-            pos_copy = dict(pos)
-            ts_str = pos_copy.get("timestamp") or pos_copy.get("positionReceived") or pos_copy.get("updateTime")
-            age_days = 0.0
-            if ts_str:
-                try:
-                    dt = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00"))
-                    age_days = (now_utc - dt).total_seconds() / 86400.0
-                except:
-                    age_days = 999.0
-            pos_copy["age_days"] = round(age_days, 2)
-            pos_copy["is_historical"] = age_days > 7.0
-            if not show_hist and age_days > 7.0:
-                v_copy["archived_position"] = pos_copy
-                v_copy["last_position"] = None
-            else:
-                v_copy["last_position"] = pos_copy
-        result_vessels.append(v_copy)
 
-    with_pos = sum(1 for v in result_vessels if v.get("last_position") and v["last_position"].get("latitude"))
-    return {
-        "vessels": result_vessels,
-        "total": len(result_vessels),
-        "with_position": with_pos,
-        "show_historical_data": show_hist,
-        "refresh_state": refresh_state
-    }
+def get_fleet_memberships(cur) -> tuple[List[Dict[str, Any]], Dict[str, List[str]], Dict[str, str]]:
+    cur.execute("SELECT id, name, icon, color, is_system FROM fleets ORDER BY is_system DESC, name ASC")
+    fleets = [dict(zip(["id", "name", "icon", "color", "is_system"], r)) for r in cur.fetchall()]
+
+    cur.execute("SELECT fleet_id, mmsi, custom_name, notes FROM fleet_vessels")
+    fv_rows = cur.fetchall()
+    mmsi_to_fleets: Dict[str, List[str]] = {}
+    mmsi_custom_name: Dict[str, str] = {}
+    fleet_counts: Dict[str, int] = {f["id"]: 0 for f in fleets}
+
+    for f_id, mmsi, c_name, notes in fv_rows:
+        mmsi_to_fleets.setdefault(mmsi, []).append(f_id)
+        if c_name and mmsi not in mmsi_custom_name:
+            mmsi_custom_name[mmsi] = c_name
+        if f_id in fleet_counts:
+            fleet_counts[f_id] += 1
+
+    for f in fleets:
+        f["vessel_count"] = fleet_counts.get(f["id"], 0)
+
+    return fleets, mmsi_to_fleets, mmsi_custom_name
+
+@app.get("/api/fleets")
+async def list_fleets():
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            fleets, _, _ = get_fleet_memberships(cur)
+            for f in fleets:
+                cur.execute("""
+                    SELECT fv.mmsi, fv.custom_name, fv.notes,
+                           v.name as ais_name, v.category, v.category_label,
+                           v.latitude, v.longitude, v.speed, v.course, v.last_seen, v.destination
+                    FROM fleet_vessels fv
+                    LEFT JOIN vessels v ON v.mmsi = fv.mmsi
+                    WHERE fv.fleet_id = ?
+                    ORDER BY (v.last_seen IS NOT NULL) DESC, v.last_seen DESC, fv.custom_name ASC
+                """, (f["id"],))
+                f["vessels"] = [dict(r) for r in cur.fetchall()]
+                f["active_count"] = sum(1 for x in f["vessels"] if x.get("latitude") is not None)
+            return {"fleets": fleets}
+    except Exception as e:
+        logger.error(f"Error in /api/fleets: {e}")
+        return {"fleets": []}
+
+@app.post("/api/fleets")
+async def create_fleet(req: FleetCreateRequest):
+    slug = re.sub(r'[^a-z0-9_]+', '_', req.name.lower().strip()).strip('_') or f"fleet_{int(time.time())}"
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM fleets WHERE id = ?", (slug,))
+            if cur.fetchone()[0] > 0:
+                slug = f"{slug}_{int(time.time()) % 10000}"
+            cur.execute(
+                "INSERT INTO fleets (id, name, icon, color, is_system) VALUES (?, ?, ?, ?, 0)",
+                (slug, req.name.strip(), req.icon or "⭐", req.color or "#f59e0b")
+            )
+            conn.commit()
+            return {"status": "ok", "id": slug}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/fleets/{fleet_id}")
+async def delete_fleet(fleet_id: str):
+    if fleet_id in ("navy", "my_fleet"):
+        raise HTTPException(status_code=400, detail="Standard-Flotten können nicht gelöscht werden.")
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute("DELETE FROM fleet_vessels WHERE fleet_id = ?", (fleet_id,))
+        conn.execute("DELETE FROM fleets WHERE id = ? AND is_system = 0", (fleet_id,))
+        conn.commit()
+    return {"status": "ok"}
+
+@app.post("/api/fleets/{fleet_id}/vessels")
+async def add_vessel_to_fleet(fleet_id: str, req: FleetVesselRequest):
+    mmsi = req.mmsi.strip()
+    if not mmsi:
+        raise HTTPException(status_code=400, detail="MMSI fehlt")
+    with sqlite3.connect(DB_FILE) as conn:
+        cur = conn.cursor()
+        c_name = (req.custom_name or "").strip() or None
+        cur.execute(
+            "INSERT OR REPLACE INTO fleet_vessels (fleet_id, mmsi, custom_name, notes) VALUES (?, ?, ?, ?)",
+            (fleet_id, mmsi, c_name, req.notes)
+        )
+        if c_name:
+            cur.execute(
+                "UPDATE vessels SET name = ? WHERE mmsi = ? AND (name IS NULL OR name LIKE 'MMSI %')",
+                (c_name, mmsi)
+            )
+        conn.commit()
+    return {"status": "ok", "fleet_id": fleet_id, "mmsi": mmsi}
+
+@app.delete("/api/fleets/{fleet_id}/vessels/{mmsi}")
+async def remove_vessel_from_fleet(fleet_id: str, mmsi: str):
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute("DELETE FROM fleet_vessels WHERE fleet_id = ? AND mmsi = ?", (fleet_id, mmsi.strip()))
+        conn.commit()
+    return {"status": "ok"}
+
+@app.get("/api/vessels")
+async def get_live_vessels(
+    max_age_minutes: int = Query(120, description="Maximales Alter für Live-Karte in Minuten (Standard 120 Min, bis 43200 = 30 Tage)"),
+    category: Optional[str] = None,
+    fleet_id: Optional[str] = None,
+    search: Optional[str] = None
+):
+    """Gibt alle Schiffe zurück, die innerhalb von max_age_minutes eine Position gemeldet haben."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=max_age_minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+
+            fleets, mmsi_to_fleets, mmsi_custom_name = get_fleet_memberships(cur)
+
+            query = """
+                SELECT * FROM vessels
+                WHERE latitude IS NOT NULL AND longitude IS NOT NULL
+                  AND last_seen >= ?
+            """
+            params: List[Any] = [cutoff]
+
+            if fleet_id and fleet_id != "ALL":
+                query += " AND mmsi IN (SELECT mmsi FROM fleet_vessels WHERE fleet_id = ?)"
+                params.append(fleet_id)
+
+            if category and category != "ALL":
+                query += " AND category = ?"
+                params.append(category)
+
+            if search:
+                q = f"%{search.strip()}%"
+                query += " AND (name LIKE ? OR mmsi LIKE ? OR callsign LIKE ? OR imo LIKE ? OR destination LIKE ?)"
+                params.extend([q, q, q, q, q])
+
+            query += " ORDER BY last_seen DESC LIMIT 3000"
+            cur.execute(query, params)
+            rows = []
+            for r in cur.fetchall():
+                d = dict(r)
+                m = d["mmsi"]
+                d["fleets"] = mmsi_to_fleets.get(m, [])
+                if (not d.get("name") or d["name"].startswith("MMSI ")) and m in mmsi_custom_name:
+                    d["name"] = mmsi_custom_name[m]
+                rows.append(d)
+
+            cur.execute("SELECT COUNT(*) FROM vessels")
+            total_mmsi_db = cur.fetchone()[0]
+
+            cur.execute("SELECT COUNT(*) FROM position_history")
+            total_waypoints = cur.fetchone()[0]
+
+            return {
+                "vessels": rows,
+                "fleets": fleets,
+                "active_count": len(rows),
+                "total_mmsi_db": total_mmsi_db,
+                "total_waypoints_30d": total_waypoints,
+                "stream_state": stream_state
+            }
+    except Exception as e:
+        logger.error(f"Error in /api/vessels: {e}")
+        return {"vessels": [], "fleets": [], "active_count": 0, "total_mmsi_db": 0, "total_waypoints_30d": 0, "stream_state": stream_state}
+
+@app.get("/api/mmsi-database")
+async def get_mmsi_database(
+    search: Optional[str] = None,
+    category: Optional[str] = None,
+    fleet_id: Optional[str] = None,
+    country: Optional[str] = None,
+    limit: int = 500,
+    offset: int = 0
+):
+    """Durchsucht die gesamte aufgebaute MMSI-Schiffsdatenbank (auch Schiffe, die gerade außer Reichweite sind)."""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+
+            fleets, mmsi_to_fleets, mmsi_custom_name = get_fleet_memberships(cur)
+
+            where_clauses = ["1=1"]
+            params: List[Any] = []
+
+            if fleet_id and fleet_id != "ALL":
+                where_clauses.append("mmsi IN (SELECT mmsi FROM fleet_vessels WHERE fleet_id = ?)")
+                params.append(fleet_id)
+
+            if category and category != "ALL":
+                where_clauses.append("category = ?")
+                params.append(category)
+
+            if country and country != "ALL":
+                where_clauses.append("country = ?")
+                params.append(country)
+
+            if search:
+                q = f"%{search.strip()}%"
+                where_clauses.append("(name LIKE ? OR mmsi LIKE ? OR callsign LIKE ? OR imo LIKE ? OR destination LIKE ?)")
+                params.extend([q, q, q, q, q])
+
+            where_sql = " AND ".join(where_clauses)
+
+            cur.execute(f"SELECT COUNT(*) FROM vessels WHERE {where_sql}", params)
+            total_matches = cur.fetchone()[0]
+
+            cur.execute(
+                f"SELECT * FROM vessels WHERE {where_sql} ORDER BY last_seen DESC LIMIT ? OFFSET ?",
+                params + [limit, offset]
+            )
+            items = []
+            for r in cur.fetchall():
+                d = dict(r)
+                m = d["mmsi"]
+                d["fleets"] = mmsi_to_fleets.get(m, [])
+                if (not d.get("name") or d["name"].startswith("MMSI ")) and m in mmsi_custom_name:
+                    d["name"] = mmsi_custom_name[m]
+                items.append(d)
+
+            return {
+                "items": items,
+                "fleets": fleets,
+                "total": total_matches,
+                "limit": limit,
+                "offset": offset
+            }
+    except Exception as e:
+        logger.error(f"Error in /api/mmsi-database: {e}")
+        return {"items": [], "fleets": [], "total": 0}
 
 @app.get("/api/history/{mmsi}")
-async def get_history(
+async def get_vessel_history(
     mmsi: str,
+    hours: Optional[int] = None,
     start: Optional[str] = None,
     end: Optional[str] = None,
     limit: int = 5000
 ):
-    """Returns stored track coordinates and history for a vessel, filtered by start and end datetime."""
-    points = get_track_history(mmsi, start_time=start, end_time=end, limit=limit)
-    return {
-        "mmsi": mmsi,
-        "total_points": len(points),
-        "start": start,
-        "end": end,
-        "points": points
-    }
+    """Gibt die gespeicherte 30-Tage-Route eines Schiffes zurück."""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
 
-@app.get("/api/history/{mmsi}/range")
-async def get_history_range_endpoint(mmsi: str):
-    """Returns available timestamp range and total point count for a vessel."""
-    return get_track_range(mmsi)
+            query = "SELECT latitude, longitude, speed, course, heading, status, timestamp FROM position_history WHERE mmsi = ?"
+            params: List[Any] = [mmsi]
 
-@app.post("/api/vessels")
-async def add_vessel(req: VesselAddRequest):
-    vessels = load_vessels()
-    for v in vessels:
-        if str(v.get("mmsi")) == str(req.mmsi):
-            raise HTTPException(status_code=400, detail="Vessel with this MMSI already exists")
-    new_v = {
-        "mmsi": req.mmsi.strip(),
-        "name": req.name.strip(),
-        "callsign": req.callsign.strip() if req.callsign else "",
-        "imo": req.imo.strip() if req.imo else "",
-        "category": req.category.strip() if req.category else "Sonstige",
-        "class_name": req.class_name.strip() if req.class_name else "",
-        "homeport": req.homeport.strip() if req.homeport else "",
-        "current_ais_name": None,
-        "last_position": None
-    }
-    vessels.append(new_v)
-    save_vessels(vessels)
-    return {"status": "ok", "vessel": new_v}
+            if hours:
+                cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                query += " AND timestamp >= ?"
+                params.append(cutoff)
+            else:
+                if start:
+                    s_clean = normalize_iso_timestamp(start)
+                    query += " AND timestamp >= ?"
+                    params.append(s_clean)
+                if end:
+                    e_clean = normalize_iso_timestamp(end)
+                    query += " AND timestamp <= ?"
+                    params.append(e_clean)
 
-@app.delete("/api/vessels/{mmsi}")
-async def delete_vessel(mmsi: str):
-    vessels = load_vessels()
-    updated = [v for v in vessels if str(v.get("mmsi")) != str(mmsi)]
-    if len(updated) == len(vessels):
-        raise HTTPException(status_code=404, detail="Vessel not found")
-    save_vessels(updated)
-    return {"status": "ok", "deleted": mmsi}
+            query += " ORDER BY timestamp ASC LIMIT ?"
+            params.append(limit)
 
-@app.post("/api/refresh/{mmsi}")
-async def refresh_single(mmsi: str):
-    cfg = load_config()
-    current_key = cfg.get("api_key") or API_KEY
-    if not current_key:
-        return {"status": "error", "message": "No REST API key configured. Use AISStream or set key in Settings."}
-    vessels = load_vessels()
-    target = None
-    for v in vessels:
-        if str(v.get("mmsi")) == str(mmsi):
-            target = v
-            break
-    if not target:
-        raise HTTPException(status_code=404, detail="Vessel not in fleet")
-    pos = await fetch_vessel_location(mmsi, current_key)
-    if not pos:
-        return {"status": "ok", "updated": False, "message": "No recent AIS position received", "vessel": target}
-    target["last_position"] = pos
-    record_position_to_archive(
-        mmsi=mmsi,
-        lat=float(pos["latitude"]),
-        lon=float(pos["longitude"]),
-        speed=float(pos.get("speed") or 0),
-        course=float(pos.get("course") or 0),
-        heading=float(pos.get("heading") or 0),
-        status=pos.get("navigationalStatus"),
-        destination=pos.get("destination"),
-        timestamp=pos.get("positionReceived") or pos.get("fetched_at"),
-        source="REST API"
-    )
-    save_vessels(vessels)
-    return {"status": "ok", "updated": True, "vessel": target}
+            cur.execute(query, params)
+            points = [dict(r) for r in cur.fetchall()]
 
-@app.post("/api/refresh-all")
-async def trigger_refresh_all(background_tasks: BackgroundTasks):
-    if refresh_state["is_refreshing"]:
-        return JSONResponse(status_code=409, content={"status": "already_running", "state": refresh_state})
-    background_tasks.add_task(run_refresh_all_task)
-    return {"status": "started", "total": len(load_vessels())}
+            cur.execute("SELECT * FROM vessels WHERE mmsi = ?", (mmsi,))
+            v_row = cur.fetchone()
 
-@app.get("/api/status")
-async def get_status():
-    cfg = load_config()
-    # Mask API keys in public status output
-    safe_cfg = {
-        "auto_refresh_daily": cfg.get("auto_refresh_daily", False),
-        "show_historical_data": cfg.get("show_historical_data", False),
-        "refresh_interval_minutes": cfg.get("refresh_interval_minutes", 10),
-        "has_api_key": bool(cfg.get("api_key")),
-        "has_aisstream_key": bool(cfg.get("aisstream_key"))
-    }
-    return {"refresh_state": refresh_state, "config": safe_cfg}
+            return {
+                "mmsi": mmsi,
+                "vessel": dict(v_row) if v_row else None,
+                "total_points": len(points),
+                "points": points
+            }
+    except Exception as e:
+        logger.error(f"Error in /api/history/{mmsi}: {e}")
+        return {"mmsi": mmsi, "points": [], "total_points": 0}
+
+@app.get("/api/stats")
+async def get_stats():
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT category, category_label, COUNT(*) FROM vessels GROUP BY category ORDER BY COUNT(*) DESC")
+            by_cat = [{"category": r[0], "label": r[1], "count": r[2]} for r in cur.fetchall()]
+
+            cur.execute("SELECT country, COUNT(*) FROM vessels GROUP BY country ORDER BY COUNT(*) DESC LIMIT 15")
+            by_country = [{"country": r[0], "count": r[1]} for r in cur.fetchall()]
+
+            cur.execute("SELECT COUNT(*) FROM vessels")
+            total_vessels = cur.fetchone()[0]
+
+            cur.execute("SELECT COUNT(*) FROM position_history")
+            total_points = cur.fetchone()[0]
+
+            cfg = load_config()
+            return {
+                "total_vessels": total_vessels,
+                "total_points": total_points,
+                "by_category": by_cat,
+                "by_country": by_country,
+                "stream_state": stream_state,
+                "config": {
+                    "retention_days": cfg.get("retention_days", 30),
+                    "bbox": cfg.get("bbox", DEFAULT_BBOX),
+                    "aisstream_key": cfg.get("aisstream_key", AISSTREAM_KEY),
+                    "datadocked_key": cfg.get("datadocked_key", ""),
+                    "carto_key": cfg.get("carto_key", CARTO_KEY)
+                }
+            }
+    except Exception as e:
+        return {"error": str(e)}
 
 @app.post("/api/settings")
-async def update_settings(req: SettingsRequest):
+async def update_settings(req: SettingsUpdate):
     cfg = load_config()
-    cfg["auto_refresh_daily"] = req.auto_refresh_daily
-    if req.show_historical_data is not None:
-        cfg["show_historical_data"] = bool(req.show_historical_data)
-    if req.refresh_interval_minutes is not None:
-        cfg["refresh_interval_minutes"] = max(1, min(120, req.refresh_interval_minutes))
-    if req.api_key is not None:
-        cfg["api_key"] = req.api_key.strip()
-    if req.aisstream_key is not None:
-        cfg["aisstream_key"] = req.aisstream_key.strip()
+    cfg["retention_days"] = max(1, min(90, req.retention_days))
+    if req.aisstream_key is not None and req.aisstream_key.strip():
+        if req.aisstream_key.strip() != cfg.get("aisstream_key"):
+            cfg["aisstream_key"] = req.aisstream_key.strip()
+            stream_state["reconnect_requested"] = True
+    if req.datadocked_key is not None:
+        cfg["datadocked_key"] = req.datadocked_key.strip()
+    if req.carto_key is not None and req.carto_key.strip():
+        cfg["carto_key"] = req.carto_key.strip()
+
+    if req.lat_min is not None and req.lon_min is not None and req.lat_max is not None and req.lon_max is not None:
+        lat1, lat2 = sorted([round(float(req.lat_min), 4), round(float(req.lat_max), 4)])
+        lon1, lon2 = sorted([round(float(req.lon_min), 4), round(float(req.lon_max), 4)])
+        new_bbox = [[[lat1, lon1], [lat2, lon2]]]
+        if new_bbox != cfg.get("bbox"):
+            cfg["bbox"] = new_bbox
+            stream_state["bbox"] = new_bbox
+            stream_state["reconnect_requested"] = True
+    elif req.bbox:
+        cfg["bbox"] = req.bbox
+        stream_state["bbox"] = req.bbox
+        stream_state["reconnect_requested"] = True
+
     save_config(cfg)
-    return {"status": "ok", "message": "Settings updated"}
+    stream_state["retention_days"] = cfg["retention_days"]
+    return {
+        "status": "ok",
+        "retention_days": cfg["retention_days"],
+        "bbox": cfg.get("bbox", DEFAULT_BBOX)
+    }
 
 @app.on_event("startup")
 async def startup_event():
     init_db()
-    
-    # Preload positions from seed/vessels.json into archive (only if valid timestamp exists)
-    vessels = load_vessels()
-    for v in vessels:
-        pos = v.get("last_position")
-        if pos and pos.get("latitude") and pos.get("longitude"):
-            normalize_position_dict(pos)
-            ts = pos.get("timestamp") or pos.get("positionReceived") or pos.get("updateTime") or pos.get("fetched_at")
-            if ts:
-                record_position_to_archive(
-                    mmsi=v.get("mmsi"),
-                    lat=pos.get("latitude"),
-                    lon=pos.get("longitude"),
-                    speed=pos.get("speed"),
-                    course=pos.get("course"),
-                    heading=pos.get("heading"),
-                    status=pos.get("navigationalStatus") or pos.get("status"),
-                    destination=pos.get("destination"),
-                    timestamp=ts,
-                    source=pos.get("dataSource") or pos.get("source") or "Archive"
-                )
-
-    asyncio.create_task(aisstream_listener())
-
-    async def daily_worker():
-        while True:
-            await asyncio.sleep(60)
-            now = datetime.now()
-            cfg = load_config()
-            if cfg.get("auto_refresh_daily"):
-                last_run = refresh_state.get("last_run")
-                today_str = now.strftime("%Y-%m-%d")
-                if now.hour == 6 and now.minute == 0 and (not last_run or not last_run.startswith(today_str)):
-                    logger.info("Triggering automatic daily refresh")
-                    await run_refresh_all_task()
-    asyncio.create_task(daily_worker())
+    asyncio.create_task(aisstream_worker())
+    asyncio.create_task(retention_cleanup_worker())
 
 static_dir = os.path.join(os.path.dirname(__file__), "static")
 os.makedirs(static_dir, exist_ok=True)

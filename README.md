@@ -1,18 +1,21 @@
-# OpenShipTracker
+# OpenShipTracker – AIS Live Radar, Fleet Filter & MMSI Database
 
-**OpenShipTracker** is a lightweight, self-hosted web application for tracking vessels in real-time using live AIS data and visualizing historical voyages on an interactive map.
+**OpenShipTracker** is a self-hosted web application for tracking all vessels in a configurable sea area (default: German Bight, Elbe/Weser/NOK & Western Baltic) in real-time via AISStream, storing a 30-day rolling track archive, and maintaining a permanent MMSI ship database.
 
 ---
 
 ## Highlights
 
-- **Real-Time AIS Stream**: Ingest live vessel positions directly from [AISStream.io](https://aisstream.io) via WebSocket.
-- **Native iOS App**: Full-featured SwiftUI & MapKit app with Onboarding Setup-Wizard, standalone live WebSocket client, voyage tracking, and server sync.
-- **Interactive Dark Map**: Leaflet-based map with Dark Matter tiles, OpenSeaMap nautical marks, heading vectors, and live position markers.
-- **Voyage & Track Filtering**: Inspect historical voyages with flexible time range presets (24h, 7d, 30d, all, custom date/time) and automatic nautical mile and speed calculations.
-- **Custom Fleet Management**: Add, categorize, and track custom ships by MMSI.
-- **Self-Contained Storage**: Uses SQLite with zero external database dependencies.
-- **Docker Ready**: One-click deployment with Docker Compose.
+- **Regional AIS Live Stream & Interactive Search Area (`Suchbereich`)**: Ingest live vessel positions (Class A & Class B) directly from [AISStream.io](https://aisstream.io) via WebSocket. Drag and resize the search area directly on the map using corner handles.
+- **Fleet Filter & Fleet Manager (`⚓ Flotten`)**:
+  - Pre-configured **Deutsche Marine** fleet (71 naval units with hull numbers & names).
+  - Personal **⭐ Meine Flotte** bookmarking with one click from any map popup or database row.
+  - Create custom fleets (e.g., club boats, tugs, SAR) and filter the live map or database by fleet.
+- **30-Day Rolling Track History**: Intelligent downsampling stores 30 days of vessel routes while keeping SQLite fast and compact.
+- **Pre-Populated MMSI Ship Database**:
+  - `data/bight.db`: SQLite database containing **3,330+ cataloged vessels** and historical tracks.
+  - `data/mmsi_database.json`: Ready-to-use JSON export of all cataloged MMSIs with ship name, callsign, IMO, dimensions, flag, and ship category.
+- **Native iOS App**: Full-featured SwiftUI & MapKit app located in `ios/`.
 
 ---
 
