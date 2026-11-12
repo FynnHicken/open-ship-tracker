@@ -240,9 +240,14 @@ def classify_ship_type(type_code: Optional[int], mmsi: str = "", name: str = "")
         nv = NAVY_MMSI_LOOKUP[mmsi]
         return ("Military", f"Deutsche Marine ({nv['category']})")
 
-    if tc == 35 or mmsi.startswith("2119") or mmsi.startswith("21121") or "WARSHIP" in upper_name or "FGS " in upper_name:
-        if tc == 35 or "FGS " in upper_name or "WARSHIP" in upper_name or mmsi.startswith("21121") or mmsi.startswith("2119"):
-            return ("Military", "Militär / Marine")
+    # Passagierschiffe (AIS Typ 60-69)
+    # Wichtig: "FGS " steht in der deutschen Binnenschifffahrt für "Fahrgastschiff" (z. B. FGS HAMBURG auf der Spree).
+    # Zivile Fahrgastschiffe dürfen niemals als Kriegsschiffe klassifiziert werden!
+    if 60 <= tc <= 69 or (upper_name.startswith("FGS ") and not (mmsi.startswith("2119") or mmsi.startswith("21121"))):
+        return ("Passenger", "Passagierschiff")
+
+    if tc == 35 or mmsi.startswith("2119") or mmsi.startswith("21121") or "WARSHIP" in upper_name:
+        return ("Military", "Militär / Marine")
     if tc == 55 or "POLIZEI" in upper_name or "ZOLL" in upper_name or "COAST GUARD" in upper_name or "BP " in upper_name:
         return ("LawEnforcement", "Behörde / Küstenwache")
     if tc == 51 or "SAR" in upper_name or "RESCUE" in upper_name:
