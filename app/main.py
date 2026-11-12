@@ -680,8 +680,9 @@ def flush_batches(positions: List[Dict[str, Any]], statics: List[Dict[str, Any]]
         logger.error(f"Error flushing batches to SQLite: {e}")
 
 async def retention_cleanup_worker():
-    """Löscht automatisch alle Positionsdaten aus position_history, die älter als retention_days (Standard: 30 Tage) sind.
-    Die MMSI-Stammdatenbank in 'vessels' bleibt dauerhaft erhalten!"""
+    """Löscht automatisch alle Positionsdaten aus position_history, die älter als retention_days (Standard: 30 Tage) sind,
+    behält aber von jedem Schiff mindestens den allerneuesten Punkt dauerhaft bei!
+    Die MMSI-Stammdatenbank in 'vessels' bleibt ebenfalls dauerhaft erhalten."""
     while True:
         try:
             cfg = load_config()
@@ -689,11 +690,15 @@ async def retention_cleanup_worker():
             cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
             with sqlite3.connect(DB_FILE) as conn:
                 cur = conn.cursor()
-                cur.execute("DELETE FROM position_history WHERE timestamp < ?", (cutoff,))
+                cur.execute("""
+                    DELETE FROM position_history
+                    WHERE timestamp < ?
+                      AND id NOT IN (SELECT MAX(id) FROM position_history GROUP BY mmsi)
+                """, (cutoff,))
                 deleted = cur.rowcount
                 conn.commit()
                 if deleted > 0:
-                    logger.info(f"30-Day Retention Cleanup: Removed {deleted} old track points before {cutoff}")
+                    logger.info(f"30-Day Retention Cleanup: Removed {deleted} old track points before {cutoff} (kept latest point per vessel)")
         except Exception as e:
             logger.error(f"Retention cleanup error: {e}")
         await asyncio.sleep(3600)  # Einmal pro Stunde prüfen
@@ -808,8 +813,11 @@ async def get_live_vessels(
     fleet_id: Optional[str] = None,
     search: Optional[str] = None
 ):
-    """Gibt alle Schiffe zurück, die innerhalb von max_age_minutes eine Position gemeldet haben."""
+    """Gibt alle Schiffe zurück, die innerhalb von max_age_minutes eine Position gemeldet haben.
+    Wenn explizit nach einem Schiff/MMSI/Rufzeichen gesucht wird (search), werden auch ältere/archivierte
+    letzte Positionen (> max_age_minutes, auch > 30 Tage) zurückgegeben und als is_historical markiert."""
     cutoff = (datetime.now(timezone.utc) - timedelta(minutes=max_age_minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    has_explicit_search = bool(search and len(search.strip()) >= 2)
     try:
         with sqlite3.connect(DB_FILE) as conn:
             conn.row_factory = sqlite3.Row
@@ -817,12 +825,19 @@ async def get_live_vessels(
 
             fleets, mmsi_to_fleets, mmsi_custom_name = get_fleet_memberships(cur)
 
-            query = """
-                SELECT * FROM vessels
-                WHERE latitude IS NOT NULL AND longitude IS NOT NULL
-                  AND last_seen >= ?
-            """
-            params: List[Any] = [cutoff]
+            if has_explicit_search:
+                query = """
+                    SELECT * FROM vessels
+                    WHERE latitude IS NOT NULL AND longitude IS NOT NULL
+                """
+                params: List[Any] = []
+            else:
+                query = """
+                    SELECT * FROM vessels
+                    WHERE latitude IS NOT NULL AND longitude IS NOT NULL
+                      AND last_seen >= ?
+                """
+                params = [cutoff]
 
             if fleet_id and fleet_id != "ALL":
                 query += " AND mmsi IN (SELECT mmsi FROM fleet_vessels WHERE fleet_id = ?)"
@@ -832,7 +847,7 @@ async def get_live_vessels(
                 query += " AND category = ?"
                 params.append(category)
 
-            if search:
+            if search and search.strip():
                 q = f"%{search.strip()}%"
                 query += " AND (name LIKE ? OR mmsi LIKE ? OR callsign LIKE ? OR imo LIKE ? OR destination LIKE ?)"
                 params.extend([q, q, q, q, q])
@@ -846,6 +861,7 @@ async def get_live_vessels(
                 d["fleets"] = mmsi_to_fleets.get(m, [])
                 if (not d.get("name") or d["name"].startswith("MMSI ")) and m in mmsi_custom_name:
                     d["name"] = mmsi_custom_name[m]
+                d["is_historical"] = bool(d.get("last_seen") and d["last_seen"] < cutoff)
                 rows.append(d)
 
             cur.execute("SELECT COUNT(*) FROM vessels")
