@@ -215,12 +215,11 @@ class SettingsUpdate(BaseModel):
     allow_registration: Optional[bool] = None
 
 class RegisterRequest(BaseModel):
-    email: str
+    username: str
     password: str
-    username: Optional[str] = None
 
 class LoginRequest(BaseModel):
-    email: str
+    username: str
     password: str
 
 class UpdateRoleRequest(BaseModel):
@@ -349,7 +348,7 @@ def get_user_from_session(token: str) -> Optional[Dict[str, Any]]:
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
             cur.execute("""
-                SELECT u.id, u.email, u.username, u.role, u.is_active, s.expires_at
+                SELECT u.id, u.username, u.role, u.is_active, s.expires_at
                 FROM user_sessions s
                 JOIN users u ON s.user_id = u.id
                 WHERE s.token = ? AND s.expires_at > ? AND u.is_active = 1
@@ -479,17 +478,17 @@ def init_db():
         conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                email TEXT UNIQUE NOT NULL,
-                username TEXT NOT NULL,
+                username TEXT UNIQUE NOT NULL,
                 password_hash TEXT NOT NULL,
                 salt TEXT NOT NULL,
                 role TEXT NOT NULL DEFAULT 'user',
                 is_active INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
-                last_login TEXT
+                last_login TEXT,
+                email TEXT
             )
         """)
-        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username)")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS user_sessions (
                 token TEXT PRIMARY KEY,
@@ -906,7 +905,6 @@ async def auth_me(request: Request):
         "authenticated": user is not None,
         "user": {
             "id": user["id"],
-            "email": user["email"],
             "username": user["username"],
             "role": user["role"]
         } if user else None,
@@ -916,10 +914,10 @@ async def auth_me(request: Request):
 
 @app.post("/api/auth/register")
 async def auth_register(req: RegisterRequest, response: Response):
-    email = req.email.strip().lower()
+    username = req.username.strip()
     password = req.password
-    if not email or "@" not in email:
-        raise HTTPException(status_code=400, detail="Bitte eine gültige E-Mail-Adresse angeben.")
+    if len(username) < 3:
+        raise HTTPException(status_code=400, detail="Der Benutzername muss mindestens 3 Zeichen lang sein.")
     if len(password) < 6:
         raise HTTPException(status_code=400, detail="Das Passwort muss mindestens 6 Zeichen lang sein.")
 
@@ -934,20 +932,19 @@ async def auth_register(req: RegisterRequest, response: Response):
         if user_count > 0 and not allow_reg:
             raise HTTPException(status_code=403, detail="Die Registrierung für neue Konten ist derzeit deaktiviert.")
 
-        cur.execute("SELECT id FROM users WHERE email = ?", (email,))
+        cur.execute("SELECT id FROM users WHERE LOWER(username) = LOWER(?)", (username,))
         if cur.fetchone():
-            raise HTTPException(status_code=400, detail="Diese E-Mail-Adresse ist bereits registriert.")
+            raise HTTPException(status_code=400, detail="Dieser Benutzername ist bereits vergeben.")
 
         # Der erste Account wird automatisch Admin!
         role = "admin" if user_count == 0 else "user"
-        username = (req.username or email.split("@")[0]).strip()
         pw_hash, salt = hash_password(password)
         now_iso = datetime.now(timezone.utc).isoformat()
 
         cur.execute("""
-            INSERT INTO users (email, username, password_hash, salt, role, created_at, last_login)
+            INSERT INTO users (username, email, password_hash, salt, role, created_at, last_login)
             VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (email, username, pw_hash, salt, role, now_iso, now_iso))
+        """, (username, username, pw_hash, salt, role, now_iso, now_iso))
         user_id = cur.lastrowid
 
     token = create_session(user_id)
@@ -963,7 +960,6 @@ async def auth_register(req: RegisterRequest, response: Response):
         "status": "ok",
         "user": {
             "id": user_id,
-            "email": email,
             "username": username,
             "role": role
         }
@@ -971,15 +967,19 @@ async def auth_register(req: RegisterRequest, response: Response):
 
 @app.post("/api/auth/login")
 async def auth_login(req: LoginRequest, response: Response):
-    email = req.email.strip().lower()
+    username = req.username.strip()
     password = req.password
     with sqlite3.connect(DB_FILE) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
-        cur.execute("SELECT * FROM users WHERE email = ? AND is_active = 1", (email,))
+        cur.execute("""
+            SELECT * FROM users 
+            WHERE (LOWER(username) = LOWER(?) OR LOWER(email) = LOWER(?)) 
+              AND is_active = 1
+        """, (username, username))
         user = cur.fetchone()
         if not user or not verify_password(password, user["password_hash"], user["salt"]):
-            raise HTTPException(status_code=401, detail="Ungültige E-Mail-Adresse oder falsches Passwort.")
+            raise HTTPException(status_code=401, detail="Ungültiger Benutzername oder falsches Passwort.")
 
         now_iso = datetime.now(timezone.utc).isoformat()
         conn.execute("UPDATE users SET last_login = ? WHERE id = ?", (now_iso, user["id"]))
@@ -997,7 +997,6 @@ async def auth_login(req: LoginRequest, response: Response):
         "status": "ok",
         "user": {
             "id": user["id"],
-            "email": user["email"],
             "username": user["username"],
             "role": user["role"]
         }
@@ -1017,7 +1016,7 @@ async def get_users_list(request: Request):
     with sqlite3.connect(DB_FILE) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
-        cur.execute("SELECT id, email, username, role, is_active, created_at, last_login FROM users ORDER BY id ASC")
+        cur.execute("SELECT id, username, role, is_active, created_at, last_login FROM users ORDER BY id ASC")
         return {"users": [dict(r) for r in cur.fetchall()]}
 
 @app.post("/api/auth/users/{user_id}/role")
