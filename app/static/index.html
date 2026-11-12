@@ -997,6 +997,43 @@
       return v.category === cat;
     }
 
+    function getVesselPopupHtml(v) {
+      return `
+        <div class="p-2 space-y-2 min-w-[240px]">
+          <div class="flex items-center justify-between border-b border-slate-800 pb-1.5">
+            <div>
+              <div class="font-bold text-sm text-white flex items-center gap-1.5">
+                <span>${v.name || 'MMSI ' + v.mmsi}</span>
+                ${v.is_historical ? '<span class="px-1.5 py-0.2 rounded text-[9px] bg-amber-500/20 text-amber-300 border border-amber-500/40 font-semibold">Letzte bekannte Pos.</span>' : ''}
+              </div>
+              <div class="text-[11px] text-slate-400">${v.category_label || 'Schiff'} • Flagge: <span class="text-slate-200 font-semibold">${v.country || '-'}</span></div>
+            </div>
+          </div>
+          <div class="grid grid-cols-2 gap-1.5 text-[11px] text-slate-300">
+            <div><span class="text-slate-500">MMSI:</span> <span class="mono">${v.mmsi}</span></div>
+            <div><span class="text-slate-500">Rufzeichen:</span> <span class="mono">${v.callsign || '-'}</span></div>
+            <div><span class="text-slate-500">IMO:</span> <span class="mono">${v.imo || '-'}</span></div>
+            <div><span class="text-slate-500">Maße:</span> ${v.length ? v.length + '×' + (v.width || '?') + 'm' : '-'}</div>
+            <div><span class="text-slate-500">Geschw.:</span> <span class="mono text-cyan-400 font-semibold">${(v.speed || 0).toFixed(1)} kn</span></div>
+            <div><span class="text-slate-500">Kurs:</span> <span class="mono">${(v.course || 0).toFixed(0)}°</span></div>
+          </div>
+          ${v.destination ? `<div class="text-[11px] bg-slate-800/80 p-1.5 rounded border border-slate-700/60"><span class="text-slate-400">Ziel:</span> <span class="font-semibold text-slate-200">${v.destination}</span></div>` : ''}
+          <div class="text-[10px] text-slate-400 flex justify-between pt-1 border-t border-slate-800">
+            <span>${v.nav_status || 'Aktiv'}</span>
+            <span>${formatAge(v.last_seen)}</span>
+          </div>
+          <div class="grid grid-cols-2 gap-1.5 pt-1">
+            <button onclick="openTrack('${v.mmsi}')" class="py-1.5 px-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-[11px] font-semibold transition">
+              🧭 Route (${v.position_count || 1})
+            </button>
+            <button onclick="quickToggleMyFleet('${v.mmsi}', '${(v.name || '').replace(/'/g, '')}')" class="py-1.5 px-2 ${(v.fleets || []).includes('my_fleet') ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40' : 'bg-slate-800 hover:bg-slate-700 text-slate-200'} rounded-lg text-[11px] font-semibold transition">
+              ${(v.fleets || []).includes('my_fleet') ? '⭐ In Meiner Flotte' : '☆ Zu Meiner Flotte'}
+            </button>
+          </div>
+        </div>
+      `;
+    }
+
     function renderSidebarAndMarkers() {
       const q = (document.getElementById('map-search').value || '').toLowerCase().trim();
       const filtered = liveVessels.filter(v => {
@@ -1007,63 +1044,48 @@
         return hay.includes(q);
       });
 
-      // Remove old markers not in filtered
-      const filteredSet = new Set(filtered.map(v => v.mmsi));
+      // Viewport bounds culling: only keep markers on screen + margin
+      const bounds = map.getBounds().pad(0.3);
+      const visibleVessels = filtered.filter(v => {
+        if (v.latitude == null || v.longitude == null) return false;
+        return bounds.contains([v.latitude, v.longitude]);
+      });
+
+      // Cap at 300 simultaneous active Leaflet markers to keep CPU at minimal level
+      const renderList = visibleVessels.slice(0, 300);
+      const renderSet = new Set(renderList.map(v => v.mmsi));
+
+      // Remove old markers not in visible set
       Object.keys(markersMap).forEach(mmsi => {
-        if (!filteredSet.has(mmsi)) {
+        if (!renderSet.has(mmsi)) {
           map.removeLayer(markersMap[mmsi]);
           delete markersMap[mmsi];
         }
       });
 
-      filtered.forEach(v => {
-        if (v.latitude == null || v.longitude == null) return;
+      renderList.forEach(v => {
         const color = categoryColors[v.category] || '#94a3b8';
         const hdg = v.heading != null ? v.heading : (v.course || 0);
-        const icon = createShipIcon(hdg, color, v.speed);
-
-        const popupHtml = `
-          <div class="p-2 space-y-2 min-w-[240px]">
-            <div class="flex items-center justify-between border-b border-slate-800 pb-1.5">
-              <div>
-                <div class="font-bold text-sm text-white flex items-center gap-1.5">
-                  <span>${v.name || 'MMSI ' + v.mmsi}</span>
-                  ${v.is_historical ? '<span class="px-1.5 py-0.2 rounded text-[9px] bg-amber-500/20 text-amber-300 border border-amber-500/40 font-semibold">Letzte bekannte Pos.</span>' : ''}
-                </div>
-                <div class="text-[11px] text-slate-400">${v.category_label || 'Schiff'} • Flagge: <span class="text-slate-200 font-semibold">${v.country || '-'}</span></div>
-              </div>
-            </div>
-            <div class="grid grid-cols-2 gap-1.5 text-[11px] text-slate-300">
-              <div><span class="text-slate-500">MMSI:</span> <span class="mono">${v.mmsi}</span></div>
-              <div><span class="text-slate-500">Rufzeichen:</span> <span class="mono">${v.callsign || '-'}</span></div>
-              <div><span class="text-slate-500">IMO:</span> <span class="mono">${v.imo || '-'}</span></div>
-              <div><span class="text-slate-500">Maße:</span> ${v.length ? v.length + '×' + (v.width || '?') + 'm' : '-'}</div>
-              <div><span class="text-slate-500">Geschw.:</span> <span class="mono text-cyan-400 font-semibold">${(v.speed || 0).toFixed(1)} kn</span></div>
-              <div><span class="text-slate-500">Kurs:</span> <span class="mono">${(v.course || 0).toFixed(0)}°</span></div>
-            </div>
-            ${v.destination ? `<div class="text-[11px] bg-slate-800/80 p-1.5 rounded border border-slate-700/60"><span class="text-slate-400">Ziel:</span> <span class="font-semibold text-slate-200">${v.destination}</span></div>` : ''}
-            <div class="text-[10px] text-slate-400 flex justify-between pt-1 border-t border-slate-800">
-              <span>${v.nav_status || 'Aktiv'}</span>
-              <span>${formatAge(v.last_seen)}</span>
-            </div>
-            <div class="grid grid-cols-2 gap-1.5 pt-1">
-              <button onclick="openTrack('${v.mmsi}')" class="py-1.5 px-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-[11px] font-semibold transition">
-                🧭 Route (${v.position_count || 1})
-              </button>
-              <button onclick="quickToggleMyFleet('${v.mmsi}', '${(v.name || '').replace(/'/g, '')}')" class="py-1.5 px-2 ${(v.fleets || []).includes('my_fleet') ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40' : 'bg-slate-800 hover:bg-slate-700 text-slate-200'} rounded-lg text-[11px] font-semibold transition">
-                ${(v.fleets || []).includes('my_fleet') ? '⭐ In Meiner Flotte' : '☆ Zu Meiner Flotte'}
-              </button>
-            </div>
-          </div>
-        `;
 
         if (markersMap[v.mmsi]) {
-          markersMap[v.mmsi].setLatLng([v.latitude, v.longitude]);
-          markersMap[v.mmsi].setIcon(icon);
-          markersMap[v.mmsi].setPopupContent(popupHtml);
+          const m = markersMap[v.mmsi];
+          const curPos = m.getLatLng();
+          if (Math.abs(curPos.lat - v.latitude) > 0.00005 || Math.abs(curPos.lng - v.longitude) > 0.00005) {
+            m.setLatLng([v.latitude, v.longitude]);
+          }
+          if (m._lastHdg !== hdg || m._lastSpeed !== v.speed || m._lastColor !== color) {
+            m.setIcon(createShipIcon(hdg, color, v.speed));
+            m._lastHdg = hdg;
+            m._lastSpeed = v.speed;
+            m._lastColor = color;
+          }
         } else {
+          const icon = createShipIcon(hdg, color, v.speed);
           const m = L.marker([v.latitude, v.longitude], { icon }).addTo(map);
-          m.bindPopup(popupHtml);
+          m._lastHdg = hdg;
+          m._lastSpeed = v.speed;
+          m._lastColor = color;
+          m.bindPopup(() => getVesselPopupHtml(v));
           m.on('click', () => openTrack(v.mmsi));
           markersMap[v.mmsi] = m;
         }
@@ -1116,10 +1138,14 @@
       }
       const m = markersMap[mmsi];
       if (m) {
-        map.setView(m.getLatLng(), 11, { animate: true });
+        map.setView(m.getLatLng(), 12, { animate: true });
         m.openPopup();
       } else if (v && v.latitude && v.longitude) {
-        map.setView([v.latitude, v.longitude], 11, { animate: true });
+        map.setView([v.latitude, v.longitude], 12, { animate: true });
+      }
+      if (window.innerWidth < 768) {
+        const mapEl = document.getElementById('map');
+        if (mapEl) mapEl.scrollIntoView({ behavior: 'smooth' });
       }
       openTrack(mmsi);
     }
@@ -1830,12 +1856,19 @@
       }
     }
 
-    // Initial Start & Auto-Poll every 4 seconds
+    // Efficient Viewport Rendering on pan/zoom
+    map.on('moveend', renderSidebarAndMarkers);
+
+    // Initial Start & Auto-Poll every 10 seconds (pauses when tab is inactive)
     checkAuth().then(isAuthed => {
       drawBBoxOverlay();
       if (isAuthed) {
         loadLiveVessels();
-        setInterval(loadLiveVessels, 4000);
+        setInterval(() => {
+          if (!document.hidden) {
+            loadLiveVessels();
+          }
+        }, 10000);
       }
     });
   </script>
