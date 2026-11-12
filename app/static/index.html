@@ -845,24 +845,77 @@
       showToast(showBBoxOnMap ? 'Suchbereich eingeblendet' : 'Suchbereich ausgeblendet');
     }
 
-    function createShipIcon(heading, color, speed) {
-      const angle = (heading !== undefined && heading !== null && !isNaN(heading)) ? heading : 0;
+    function getBaseShipPx(zoom) {
+      if (zoom <= 7) return 15;
+      if (zoom <= 9) return 19;
+      if (zoom <= 11) return 25;
+      if (zoom <= 13) return 33;
+      if (zoom <= 15) return 44;
+      return 56;
+    }
+
+    function getVesselScaleFactor(length, category) {
+      const defLen = defaultLengthByCategory[category] || 60;
+      const len = Math.max(8, Math.min(420, parseFloat(length) || defLen));
+      // Logarithmische Skalierung: 8m (0.72) bis 400m (1.60)
+      const ratio = Math.log10(len / 8) / Math.log10(400 / 8);
+      return 0.72 + (Math.max(0, Math.min(1, ratio)) * 0.88);
+    }
+
+    function createShipIcon(heading, color, speed, length, zoom, category, name) {
+      const hasHeading = heading !== undefined && heading !== null && !isNaN(heading) && heading !== 511;
+      const angle = hasHeading ? heading : 0;
       const isMoving = (parseFloat(speed) || 0) >= 0.5;
-      const svg = isMoving
-        ? `<svg width="24" height="24" viewBox="0 0 32 32" style="transform: rotate(${angle}deg); transform-origin: center; filter: drop-shadow(0 2px 4px rgba(0,0,0,0.8));">
-             <path d="M16 2 C20 7 21 14 21 27 L11 27 C11 14 12 7 16 2 Z" fill="${color}" stroke="#0f172a" stroke-width="1.8" stroke-linejoin="round" />
-             <rect x="13.5" y="15" width="5" height="5" rx="1" fill="#0f172a" opacity="0.6" />
-           </svg>`
-        : `<svg width="16" height="16" viewBox="0 0 24 24" style="filter: drop-shadow(0 1px 3px rgba(0,0,0,0.8));">
-             <circle cx="12" cy="12" r="6" fill="${color}" stroke="#0f172a" stroke-width="2" />
-           </svg>`;
-      return L.divIcon({
-        className: 'ship-marker',
-        html: svg,
-        iconSize: isMoving ? [24, 24] : [16, 16],
-        iconAnchor: isMoving ? [12, 12] : [8, 8],
-        popupAnchor: [0, -12]
-      });
+
+      const basePx = getBaseShipPx(zoom || 11);
+      const factor = getVesselScaleFactor(length, category);
+      const iconH = Math.max(16, Math.min(74, Math.round(basePx * factor)));
+      const iconW = Math.max(12, Math.round(iconH * 0.46));
+      const halfW = Math.round(iconW / 2);
+      const halfH = Math.round(iconH / 2);
+
+      let svg = '';
+      if (isMoving || hasHeading) {
+        // Schiff in Fahrt oder am Liegeplatz mit bekanntem Bugkurs: Rumpf-Silhouette mit Richtung
+        const opacity = isMoving ? '1' : '0.85';
+        const strokeDash = isMoving ? '' : 'stroke-dasharray="3,1.5"';
+        const innerDetail = isMoving
+          ? `<rect x="11" y="34" width="10" height="12" rx="2" fill="#020617" opacity="0.6"/>
+             <line x1="16" y1="4" x2="16" y2="24" stroke="#020617" stroke-width="1.5" opacity="0.5"/>`
+          : `<circle cx="16" cy="34" r="5" fill="#020617" opacity="0.75"/>
+             <circle cx="16" cy="34" r="2.2" fill="${color}"/>`;
+
+        svg = `
+          <svg width="${iconW}" height="${iconH}" viewBox="0 0 32 64" style="transform: rotate(${angle}deg); transform-origin: center; filter: drop-shadow(0 2px 4px rgba(0,0,0,0.8)); overflow: visible;">
+            <path d="M16 2 C25 10 27 22 26 58 L6 58 C5 22 7 10 16 2 Z" fill="${color}" fill-opacity="${opacity}" stroke="#020617" stroke-width="2.2" stroke-linejoin="round" ${strokeDash}/>
+            ${innerDetail}
+          </svg>
+        `;
+        return L.divIcon({
+          className: 'ship-marker',
+          html: svg,
+          iconSize: [iconW, iconH],
+          iconAnchor: [halfW, halfH],
+          popupAnchor: [0, -halfH]
+        });
+      } else {
+        // Liegeplatz / Vor Anker ohne bekannten Bugkurs: Kreisrunder Liegeplatz-Marker
+        const circleD = Math.max(14, Math.min(32, Math.round(iconW * 1.1)));
+        const halfC = Math.round(circleD / 2);
+        svg = `
+          <svg width="${circleD}" height="${circleD}" viewBox="0 0 24 24" style="filter: drop-shadow(0 1px 3px rgba(0,0,0,0.8));">
+            <circle cx="12" cy="12" r="9" fill="${color}" stroke="#020617" stroke-width="2" />
+            <circle cx="12" cy="12" r="4" fill="#020617" opacity="0.8" />
+          </svg>
+        `;
+        return L.divIcon({
+          className: 'ship-marker',
+          html: svg,
+          iconSize: [circleD, circleD],
+          iconAnchor: [halfC, halfC],
+          popupAnchor: [0, -halfC]
+        });
+      }
     }
 
     let hullsMap = {};
@@ -1132,15 +1185,16 @@
         const color = categoryColors[v.category] || '#94a3b8';
         const hdg = v.heading != null ? v.heading : (v.course || 0);
 
-        // Dynamische Umschaltung basierend auf tatsächlicher Schiffslänge & Pixelgröße auf dem Bildschirm:
-        // Ein Schiff wird NUR DANN als maßstabsgetreuer Rumpf gezeichnet, wenn es bei aktuellem Zoom
-        // mindestens 26 Pixel lang auf dem Bildschirm wäre.
-        // Kleine Boote (z.B. 10-25m Segel-/Motorboote) bleiben so immer als gut sichtbare Marker erkennbar!
+        // Viewport- & Längen-Skalierung:
+        // Bei normaler Übersicht (Zoom 1-15) werden alle Schiffe als dynamisch skalierte,
+        // typgerechte ECDIS-Rumpf-Marker dargestellt (mit Mindestgröße für kleine Boote).
+        // Erst bei maximalem Hafen-Zoom (Zoom >= 16) und ausreichend großem Rumpf (>= 36px)
+        // wird auf das maßstabsgetreue Meter-Polygon am Kai umgeschaltet.
         const defLen = defaultLengthByCategory[v.category] || 60;
         const vLen = Math.max(10, Math.min(450, parseFloat(v.length) || defLen));
         const mpp = getMetersPerPixel(v.latitude, zoom);
         const pixelLength = vLen / mpp;
-        const showAsHullPolygon = pixelLength >= 26;
+        const showAsHullPolygon = zoom >= 16 && pixelLength >= 36;
 
         if (showAsHullPolygon) {
           currentActivePolys.add(v.mmsi);
@@ -1172,7 +1226,7 @@
             hullsMap[v.mmsi] = poly;
           }
         } else {
-          // Kleines Boot oder herausgezoomt: Klares, gut klickbares Navigations-Icon (mindestens 20-24px)
+          // Viewport-skalierter Rumpf-Marker (skaliert mit Zoom & relativer Schiffslänge)
           currentActiveMarkers.add(v.mmsi);
           if (hullsMap[v.mmsi]) {
             map.removeLayer(hullsMap[v.mmsi]);
@@ -1185,18 +1239,22 @@
             if (Math.abs(curPos.lat - v.latitude) > 0.00005 || Math.abs(curPos.lng - v.longitude) > 0.00005) {
               m.setLatLng([v.latitude, v.longitude]);
             }
-            if (m._lastHdg !== hdg || m._lastSpeed !== v.speed || m._lastColor !== color) {
-              m.setIcon(createShipIcon(hdg, color, v.speed));
+            if (m._lastZoom !== zoom || m._lastHdg !== hdg || m._lastSpeed !== v.speed || m._lastColor !== color || m._lastLen !== v.length) {
+              m.setIcon(createShipIcon(hdg, color, v.speed, v.length, zoom, v.category, v.name));
+              m._lastZoom = zoom;
               m._lastHdg = hdg;
               m._lastSpeed = v.speed;
               m._lastColor = color;
+              m._lastLen = v.length;
             }
           } else {
-            const icon = createShipIcon(hdg, color, v.speed);
+            const icon = createShipIcon(hdg, color, v.speed, v.length, zoom, v.category, v.name);
             const m = L.marker([v.latitude, v.longitude], { icon }).addTo(map);
+            m._lastZoom = zoom;
             m._lastHdg = hdg;
             m._lastSpeed = v.speed;
             m._lastColor = color;
+            m._lastLen = v.length;
             m.bindPopup(() => getVesselPopupHtml(v));
             m.on('click', () => openTrack(v.mmsi));
             markersMap[v.mmsi] = m;
